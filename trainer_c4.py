@@ -9,7 +9,7 @@ import time
 from tqdm import tqdm
 # from matplotlib import pyplot as plt
 from model import StackedAttention
-# import online_opt
+import onlineopt
 from omegaconf import OmegaConf
 from omegaconf.errors import ConfigAttributeError
 from optional_module import optional_module
@@ -36,25 +36,39 @@ def update_param_copy_(model, to_store):
 
 @torch.no_grad()
 def set_params(model, params):
-    for model_p, toset_p in zip(model.parameters, params):
+    for model_p, toset_p in zip(model.parameters(), params):
         model_p.copy_(toset_p)
 
 class SwapParameters:
     '''
     warning: this contex manager will wipe out any gradient info!
     '''
-    def __init__(self, model, parameters):
+    def __init__(self, model, parameters, saved_storage):
         self.model = model
         self.parameters = parameters
+        self.saved_storage = saved_storage
 
     def __enter__(self):
-        self.saved_parameters = get_param_copy(self.model)
+        # self.saved_parameters = get_param_copy(self.model)
+        update_param_copy_(self.model, self.saved_storage)
         set_params(self.model, self.parameters)
     
     def __exit__(self, exc_type, exc_value, traceback):
-        set_params(self.model, self.saved_parameters)
+        set_params(self.model, self.saved_storage)
             
 
+class SwapManager:
+    '''
+    wrapper around SwapParameters so that if we use it many times
+    with the same model, the temporary storage for the model parameters
+    is always the same memory, saving a lot of allocation/delocations.
+    '''
+    def __init__(self, model):
+        self.model = model
+        self.saved_storage = get_param_copy(model)
+    
+    def swap(self, parameters):
+        return SwapParameters(self.model, parameters, self.saved_storage)
 
 # class TrainConfig:
 #     def __init__(self, **kwargs):
@@ -84,8 +98,8 @@ class Trainer:
 
         if self.config.optimizer == 'adamw':
             self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.wd, betas=(config.beta1, config.beta2))
-        # elif config.opt == 'randomol':
-        #     optimizer = online_opt.RandomOL(model.parameters(), config=config, logger=wandb)
+        elif self.config.optimizer == 'pertensor_randomol':
+            self.optimizer = onlineopt.PerTensorRandomOL(model.parameters(), config=config, logger=wandb)
         # self.losses = []
 
 
@@ -103,6 +117,8 @@ class Trainer:
         # self.valid_iter = enumerate(self.valid_loader)
 
         self.total_difference = 0
+
+        self.swap_manager = SwapManager(self.model)
 
     def run_epoch(self, epoch_num):
         iterations_per_epoch = self.config.valid_frequency_examples // self.config.batch_size
@@ -145,18 +161,18 @@ class Trainer:
                     features, loss, accuracy = model(idx, mask, labels)
                 return features, loss, accuracy
 
-            if config.log_differences and config.optimizer == 'randomol':
-                with SwapParameters(self.model, previous_parameters):
+            if config.log_differences:
+                with self.swap_manager.swap(previous_parameters):
                     features, prev_loss, accuracy = inference()
                 
                 features, cur_loss, accuracy = inference()
 
                 loss_difference = prev_loss - cur_loss
-                total_difference += loss_difference
+                self.total_difference += loss_difference
 
                 log_dict.update({
                         'optimizer/loss_difference': loss_difference,
-                        'optimizer/total_loss_difference': total_difference,
+                        'optimizer/total_loss_difference': self.total_difference,
                     })     
 
             update_param_copy_(model, previous_parameters)
@@ -209,9 +225,7 @@ class Trainer:
 
             for _ in range(config.ministeps-1):
                 # take ministeps steps on the current loss...
-                model.zero_grad()
-                features, loss, accuracy = model(idx, mask)
-                loss.backward()
+                features, loss, accuracy = get_loss()
                 self.optimizer.step()
 
             if (t+1) % iterations_per_epoch == 0:
