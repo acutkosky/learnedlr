@@ -1,0 +1,7 @@
+torch
+transformers
+datasets
+omegaconf
+wandb
+einops
+tqdm
