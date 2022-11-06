@@ -20,7 +20,7 @@ finally, initialize wandb:
 wandb init
 ```
 
-To configure runs, you should create a config yaml file. The default values for the model architecture are stored in `config/model/base.yaml`.
+To configure runs, you should create a config yaml file (e.g. see `config/default.yaml`). The default values for the model architecture are stored in `config/model/base.yaml`.
 The default values for the training parameters are stored in `config/train/base.yaml`. Your config file can override any of these. Model parameters
 should be nested under a `model_config` heading and training parameters under a `train_config` heading, as in:
 ```
