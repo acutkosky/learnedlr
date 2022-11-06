@@ -6,13 +6,10 @@ beta3: 0.99999
 eps: 0.0001
 batch_size: 512
 epochs: 200
-ministeps: 1
+ministeps: 1 #number of steps to do on a particular minibatch before moving to next one
 wd: 0.0
 scale_type: random
 log_differences: true
-recenter: true
-swapol: true
-implicit: true
 warmup_examples: 128000
 debias: true
 optimizer: ???

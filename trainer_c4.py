@@ -431,7 +431,10 @@ if __name__=='__main__':
 
     wandb = optional_module(wandb, config.train.logging)
     wandb.init(project=config.train.wandb_project)
-    wandb.config.update(config._content)
+    wandb.config.update({
+        'train': config.train._content,
+        'model': config.model._content,
+        })
     initialize_and_train_model(config)
 
 
