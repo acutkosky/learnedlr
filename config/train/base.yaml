@@ -1,22 +1,36 @@
-lr: 3e-4
-beta: 0.9
-beta1: 0.9
+optimizer: ??? # current options: adamw, pertensor_randomol
+
+# generic options useful for all training algorithms
+warmup_examples: 512000 # how many examples of linear warmup to perform
+lr: 3e-4 # learning rate
+beta1: 0.9 #beta values for adam algorithms
 beta2: 0.99
-beta3: 0.99999
-eps: 0.0001
-batch_size: 512
+wd: 0.0 # weight decay
+
+# options for randomol optimizer
+###########
+ol: ptscaleadamw # which OL to use (see REGISTRY dictionaries in onlineopt.py)
+
+scale_type: random # where to calculate gradients: random=random point between iterates, half=midpoint, one=at each iterate, exp=exponential distribution.
+epsilon: 1e-8 # small value originally for numerical precision issues that actually does influence perfomance on adamw
+
+expmd_min: 1e-10 # minimum value for the exponential updates md with optimal dynamic regret algorithm.
+expmd_max: 1e-2 # maximum value for exponential updates md algorithm.
+##########
+
+# generic options for the trainer
+dataset: c4
+context_length: 10
+num_workers: 4 # number of workers to use for loading each dataset (you might need this to be 1/2 the number of CPUs since there is both train and test, even though technically they are not needed at the same time.)
+batch_size: 1024 
+valid_frequency_examples: 409600 # how many training examples to process between computing validation performance (training set is too big to actually pass all the way through even once)
+valid_examples: 102400 # how many examples to use for validation (validation set is pretty big, so we just subsample by looping through it when computing validation stats)
 epochs: 200
 ministeps: 1 #number of steps to do on a particular minibatch before moving to next one
-wd: 0.0
-scale_type: random
-log_differences: true
-warmup_examples: 128000
-debias: true
-optimizer: ???
-dataset: c4
-valid_frequency_examples: 128000000
-context_length: 1024
-valid_examples: 102400000
-num_workers: 8
-logging: True
-wandb_project: learnedlr
+
+
+# options for wandb
+logging: true
+wandb_project: learnedlrC4_test
+log_interval: 50
+log_differences: true # record sum_t L(x_t,z_t) - L(x_{t-1},z_t) where x_t is the model parameters, z_t is the t^th minibatch and L is the loss.

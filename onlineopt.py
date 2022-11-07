@@ -29,15 +29,11 @@ class OnlineLearner:
         '''
         pass
 
-    def update(self, grad):
+    def update(self, grad, **aux):
         '''
         do the update.
         args:
-            params_and_grads: list (param, gradient) tuples.
-                the param is a pytorch tensor parameter in the model we are training.
-                the grad is a gradient (not necessarily the gradient with respect to the param)
-                The online learner is maintaining an iterate for each param, so that the 
-                param just serves as a key into a dictionary of iterates.
+            grad: gradient information
         
         returns nothing (should use get_iterate to get the iterate)
         '''
@@ -112,7 +108,7 @@ class OGD(OnlineLearner):
         super().__init__(name, config, outer_learner)
         self.lr = config.lr
         self.iterate = 0.0
-        self.constraint = config.get('constraint', None)
+        self.constraint = config.get('ogd_constraint', None)
 
     def update(self, grad):
         self.iterate.add_(grad, alpha=-self.lr)
@@ -176,7 +172,7 @@ class AdamW(OnlineLearner):
 
 
 class PerTensorScaleAdamW(OnlineLearner):
-    def __init__(self, config, outer_learner, param, name='AdamW', **kwargs):
+    def __init__(self, config, outer_learner, param, name='PerTensorScaleAdamW', **kwargs):
         super().__init__(name, config, outer_learner)
 
         self.param = param
@@ -239,14 +235,87 @@ class PerTensorScaleAdamW(OnlineLearner):
         }
 
 
-PER_TENSOR_OL_REGISTRY = {
-    'adamw': AdamW,
-    'ptscaleadamw': PerTensorScaleAdamW,
-}
 
-GLOBAL_OL_REGISTRY = {
-    'ogd': OGD,
-}
+
+class GlobalScaleAdamW(OnlineLearner):
+    def __init__(self, config, outer_learner, name='GlobalScaleAdamW', **kwargs):
+        super().__init__(name, config, outer_learner)
+
+
+        self.state = {}
+        device = None
+        for group in outer_learner.param_groups:
+            for param in group['params']:
+                p_state = {}
+                p_state['M'] = torch.zeros_like(param)
+                p_state['V'] = torch.zeros_like(param)
+                p_state['iterate'] = torch.zeros_like(param)
+
+                self.state[param] = p_state
+
+                device = param.device # this is hacky, idk what to do if params live on multiple devices yet...
+        
+        self.outer_learner = outer_learner
+        
+        self.lr = config.lr
+        self.warmed_up_lr = 0.0
+
+        self.scale_learner = ExpMD(config, device=device)
+
+        self.epsilon = config.get('epsilon', SMALL_VALUE)
+
+        self.count = 0
+
+        self.beta1 = config.beta1
+        self.beta2 = config.beta2
+        self.wd = config.wd
+
+
+    def warmup_lr(self):
+        self.warmed_up_lr = self.lr * min(1, float(self.count) / float(max(1, self.config.warmup_steps)))
+        return self.warmed_up_lr
+
+
+    def compute_meta_gradient(self, grad):
+        return torch.sum(grad * self.iterate)/self.scale_learner.get_iterate()
+
+    def pre_update(self, info):
+        meta_gradient = info['total_correlation']/self.scale_learner.get_iterate()
+        self.scale_learner.update(meta_gradient)
+
+    def update(self, cors_and_grads):
+
+        self.count += 1
+        self.warmup_lr()
+
+        for param in cors_and_grads:
+            grad = cors_and_grads[param]['grad']
+
+            state = self.state[param]
+
+
+            # AdamW update
+            state['M'].mul_(self.beta1)
+            state['M'].add_(grad, alpha=1.0-self.beta1)
+
+            state['V'].mul_(self.beta2)
+            state['V'].add_(grad**2, alpha=1.0-self.beta2)
+
+            
+
+            M_hat = state['M']/(1.0-self.beta1**self.count)
+            V_hat = state['V']/(1.0-self.beta2**self.count)
+
+            state['iterate'] = -self.scale_learner.get_iterate() * self.warmed_up_lr * (M_hat/ (torch.sqrt(V_hat) + self.epsilon) + self.wd * param)
+        
+    def get_iterate(self):
+        return self.state
+
+    def get_logging_info(self, aux=None):
+        return {
+            'optimizer/learned_lr': self.scale_learner.get_iterate(),
+        }
+
 
 class PerTensorRandomOL(torch.optim.Optimizer):
 
@@ -351,6 +420,121 @@ class PerTensorRandomOL(torch.optim.Optimizer):
 
 
 
+
+
+class GlobalRandomOL(torch.optim.Optimizer):
+
+    def __init__(self, params, config, logger, **kwargs):
+        
+        super().__init__(params, kwargs)
+
+        self.config = config
+        self.logger = logger
+        self.count = 0
+
+        self.__setstate__(self.state)
+
+        # might be important to initialize this AFTER __setstate__.
+        self.ol = GLOBAL_OL_REGISTRY[self.config.ol.lower()](self.config, outer_learner=self)
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+
+        for group in self.param_groups:
+            for param in group['params']:
+                state = self.state[param]
+
+                state['iterate'] = param.clone().detach_()
+                state['offset'] = torch.zeros_like(param)
+
+        self.state['reward'] = 0.0
+
+    def offset_cors_and_grads(self):
+        correlations = {}
+        total_correlation = 0.0
+        for group in self.param_groups:
+            for param in group['params']:
+
+                if param.grad is None:
+                    continue
+
+                state = self.state[param]
+
+                
+                correlation = torch.sum(state['offset'] * param.grad)
+                correlations[param] = {
+                    'correlation': correlation,
+                    'grad': param.grad
+                }
+
+                total_correlation += correlation
+
+        return correlations, total_correlation
+
+
+
+    
+    @torch.no_grad()
+    def step(self, closure=None):
+
+        self.count += 1
+        logging_info = {}
+
+        if self.config.scale_type == 'random':
+            scaling = random.random()
+        elif self.config.scale_type == 'half':
+            scaling = 0.5
+        elif self.config.scale_type == 'one':
+            scaling = 1.0
+        elif self.config.scale_type ==  'exp':
+            scaling = -np.log(1.0-random.random())
+
+
+        cors_and_grads, total_correlation = self.offset_cors_and_grads()
+        self.state['reward'] -= total_correlation
+
+        logging_info.update({
+            'optimizer/total_reward': self.state['reward'],
+            'optimizer/current_reward': -total_correlation,
+        })
+
+        self.ol.pre_update({'total_correlation': total_correlation})
+        self.ol.update(cors_and_grads)
+        new_offsets = self.ol.get_iterate()
+
+        for param in new_offsets:
+            state = self.state[param]
+            state['offset'].copy_(new_offsets[param]['iterate'])
+
+            if self.config.scale_type != 'exp':
+                param.copy_(state['iterate'] + scaling*state['offset'])
+                state['iterate'].add_(state['offset'])
+            else:
+                param.add_(state['offset'], alpha=scaling)
+                state['iterate'].copy_(param)  
+
+        logging_info.update(self.ol.get_logging_info(logging_info))          
+
+        self.logger.log(
+            logging_info,
+            commit=False
+        )
+
+        
+
+        
+
+
+
+
+PER_TENSOR_OL_REGISTRY = {
+    'adamw': AdamW,
+    'ptscaleadamw': PerTensorScaleAdamW,
+}
+
+GLOBAL_OL_REGISTRY = {
+    'gscaleadamw': GlobalScaleAdamW,
+}
 
 
 
