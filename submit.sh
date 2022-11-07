@@ -11,8 +11,8 @@
 #$ -l gpu_c=3.7
 #$ -l gpu_memory=13G
 
-#specify a project
-#$ -P aclab
+#specify a project (probably not necessary, so currently off)
+##     $ -P aclab
 
 #merge the error and output
 #$ -j y
