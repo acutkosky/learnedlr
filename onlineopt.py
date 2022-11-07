@@ -15,7 +15,7 @@ class OnlineLearner:
         self.outer_learner = outer_learner
 
 
-    def get_logging_info(self):
+    def get_logging_info(self, aux=None):
         '''
         return a dictionary of logging data
         '''
@@ -56,6 +56,54 @@ class OnlineLearner:
         '''
         return self.iterate
 
+
+
+
+class ExpMD(OnlineLearner):
+    # This algorithm has an optimal dynamic regret guarantee
+    # which I cannot say for methods that actually choose a betting fraction intelligently (although it may be true)
+    def __init__(self, config, device, outer_learner=None, name='ExpMD', **kwargs):
+        super().__init__(name, config, outer_learner)
+        self.lrs = torch.tensor([3**k for k in range(-15,5)], device=device)
+        self.min_value = config.get('expmd_min', 1e-10)
+        self.max_value = config.get('expmd_max', 1e-2)
+
+        self.max_grad = torch.zeros(1, device=device)
+        self.max_grad_beta = 0.99
+
+        self.sub_iterates = torch.ones_like(self.lrs) * 1e-8
+
+        self.count = 0.0
+
+        self.iterate = torch.sum(self.sub_iterates)
+
+
+    def update(self, grad):
+
+        self.count += 1.0
+        
+        # max_grad = self.max_grad/(1.0 - self.max_grad_beta**self.count)
+        # orig_grad = grad
+
+        # grad = torch.clamp(grad, -self.max_grad, self.max_grad)
+
+        # grad = grad/(self.max_grad + SMALL_VALUE)
+
+
+        # self.max_grad.mul_(self.max_grad_beta)
+        # self.max_grad.copy_(torch.max(torch.abs(orig_grad), self.max_grad))
+
+
+        self.sub_iterates.mul_(torch.exp(-self.lrs*grad - (0.5 + 1.0/self.count)*self.lrs**2 * grad**2))
+
+        self.sub_iterates.clamp_(min=self.min_value, max=self.max_value)
+
+        self.iterate = torch.sum(self.sub_iterates)
+
+    def get_logging_info(self, aux=None):
+        return {
+            'optimizer/learned_lr': self.get_iterate()
+        }
 
 
 
@@ -119,14 +167,81 @@ class AdamW(OnlineLearner):
 
         self.iterate = -self.warmed_up_lr * (M_hat/ (torch.sqrt(V_hat) + self.epsilon) + self.wd * self.param)
 
-    def get_logging_info(self):
+    def get_logging_info(self, aux=None):
         return {
             'optimizer/learned_lr': self.warmed_up_lr
         }
 
 
+
+
+class PerTensorScaleAdamW(OnlineLearner):
+    def __init__(self, config, outer_learner, param, name='AdamW', **kwargs):
+        super().__init__(name, config, outer_learner)
+
+        self.param = param
+
+        self.lr = config.lr
+        self.warmed_up_lr = 0.0
+        self.iterate = torch.zeros_like(self.param)
+        self.M = torch.zeros_like(self.iterate)
+        self.V = torch.zeros_like(self.iterate)
+
+        self.scale_learner = ExpMD(config, device=param.device)
+
+        self.epsilon = config.get('epsilon', SMALL_VALUE)
+
+        self.count = 0
+
+        self.beta1 = config.beta1
+        self.beta2 = config.beta2
+        self.wd = config.wd
+
+
+    def warmup_lr(self):
+        self.warmed_up_lr = self.lr * min(1, float(self.count) / float(max(1, self.config.warmup_steps)))
+        return self.warmed_up_lr
+
+
+    def compute_meta_gradient(self, grad):
+        return torch.sum(grad * self.iterate)/self.scale_learner.get_iterate()
+
+
+    def update(self, grad):
+
+        meta_gradient = self.compute_meta_gradient(grad)
+        self.scale_learner.update(meta_gradient)
+
+        self.count += 1
+        self.warmup_lr()
+        # AdamW update
+        self.M.mul_(self.beta1)
+        self.M.add_(grad, alpha=1.0-self.beta1)
+
+        self.V.mul_(self.beta2)
+        self.V.add_(grad**2, alpha=1.0-self.beta2)
+
+        
+
+        M_hat = self.M/(1.0-self.beta1**self.count)
+        V_hat = self.V/(1.0-self.beta2**self.count)
+
+        self.iterate = -self.scale_learner.get_iterate() * self.warmed_up_lr * (M_hat/ (torch.sqrt(V_hat) + self.epsilon) + self.wd * self.param)
+
+    def get_logging_info(self, aux=None):
+        max_lr = max((self.warmed_up_lr * self.scale_learner.get_iterate()).item(), 
+            aux.get('optimizer/max_learned_lr', 0.0))
+        min_lr = min((self.warmed_up_lr * self.scale_learner.get_iterate()).item(),
+            aux.get('optimizer/min_learned_lr', 100.0))
+        return {
+            'optimizer/max_learned_lr': max_lr,
+            'optimizer/min_learned_lr': min_lr
+        }
+
+
 PER_TENSOR_OL_REGISTRY = {
     'adamw': AdamW,
+    'ptscaleadamw': PerTensorScaleAdamW,
 }
 
 GLOBAL_OL_REGISTRY = {
@@ -222,7 +337,7 @@ class PerTensorRandomOL(torch.optim.Optimizer):
                     param.add_(state['offset'], alpha=scaling)
                     state['iterate'].copy_(param)
 
-                logging_info.update(state['ol'].get_logging_info())
+                logging_info.update(state['ol'].get_logging_info(logging_info))
 
         
         self.logger.log(

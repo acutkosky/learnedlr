@@ -1,0 +1,13 @@
+train:
+  optimizer: adamw
+  warmup_examples: 512000
+  lr: 1e-4
+  beta1: 0.9
+  beta2: 0.99
+  batch_size: 1024
+  valid_frequency_examples: 409600
+  valid_examples: 102400
+
+  logging: true
+  wandb_project: learnedlrC4
+  log_interval: 50

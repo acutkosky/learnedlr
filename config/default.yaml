@@ -1,13 +1,30 @@
 train:
-  optimizer: adamw
-  warmup_examples: 512000
-  lr: 3e-4
-  beta1: 0.9
-  beta2: 0.99
-  batch_size: 1024
-  valid_frequency_examples: 409600
-  valid_examples: 102400
+  optimizer: adamw # current options: adamw, pertensor_randomol
 
+  # generic options useful for all training algorithms
+  warmup_examples: 512000 # how many examples of linear warmup to perform
+  lr: 3e-4 # learning rate
+  beta1: 0.9 #beta values for adam algorithms
+  beta2: 0.99
+
+  # options for randomol optimizer
+  ###########
+  ol: ptscaleadamw # which OL to use (see REGISTRY dictionaries in onlineopt.py)
+
+  scale_type: random # where to calculate gradients: random=random point between iterates, half=midpoint, one=at each iterate, exp=exponential distribution.
+  epsilon: 1e-8 # small value originally for numerical precision issues that actually does influence perfomance on adamw
+
+  expmd_min: 1e-10 # minimum value for the exponential updates md with optimal dynamic regret algorithm.
+  expmd_max: 1e-2 # maximum value for exponential updates md algorithm.
+  ##########
+
+  # generic options for the trainer
+  batch_size: 1024 
+  valid_frequency_examples: 409600 # how many training examples to process between computing validation performance (training set is too big to actually pass all the way through even once)
+  valid_examples: 102400 # how many examples to use for validation (validation set is pretty big, so we just subsample by looping through it when computing validation stats)
+
+
+  # options for wandb
   logging: true
-  wandb_project: learnedlrC4
+  wandb_project: learnedlrC4_test
   log_interval: 50
