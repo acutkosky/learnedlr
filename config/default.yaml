@@ -7,6 +7,8 @@ train:
   beta1: 0.9 #beta values for adam algorithms
   beta2: 0.99
 
+  adamw_normalize: none # set to normalize to normalize adam updates
+
   # options for randomol optimizer
   ###########
   ol: ptscaleadamw # which OL to use (see REGISTRY dictionaries in onlineopt.py)
@@ -16,6 +18,10 @@ train:
 
   expmd_min: 1e-10 # minimum value for the exponential updates md with optimal dynamic regret algorithm.
   expmd_max: 1e-2 # maximum value for exponential updates md algorithm.
+  expmd_sum_vs_mean: 'sum'
+
+  correct_inner_products: false # whether to rescale gradient inner products to be equal to actual loss differences.
+  
   ##########
 
   # generic options for the trainer

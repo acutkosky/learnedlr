@@ -64,6 +64,8 @@ class ExpMD(OnlineLearner):
         self.min_value = config.get('expmd_min', 1e-10)
         self.max_value = config.get('expmd_max', 1e-2)
 
+        self.sum_mean = config.get('expmd_sum_vs_mean', 'sum')
+
         self.max_grad = torch.zeros(1, device=device)
         self.max_grad_beta = 0.99
 
@@ -71,7 +73,14 @@ class ExpMD(OnlineLearner):
 
         self.count = 0.0
 
-        self.iterate = torch.sum(self.sub_iterates)
+
+        # self.iterate = torch.sum(self.sub_iterates)
+
+    def get_iterate(self):
+        if self.sum_mean == 'sum':
+            return torch.sum(self.sub_iterates)
+        else:
+            return torch.mean(self.sub_iterates)
 
 
     def update(self, grad):
@@ -94,7 +103,7 @@ class ExpMD(OnlineLearner):
 
         self.sub_iterates.clamp_(min=self.min_value, max=self.max_value)
 
-        self.iterate = torch.sum(self.sub_iterates)
+        # self.iterate = torch.sum(self.sub_iterates)
 
     def get_logging_info(self, aux=None):
         return {
@@ -132,6 +141,8 @@ class AdamW(OnlineLearner):
         self.M = torch.zeros_like(self.iterate)
         self.V = torch.zeros_like(self.iterate)
 
+        self.normalize = config.get('adamw_normalize', 'none')
+
         self.epsilon = config.get('epsilon', SMALL_VALUE)
 
         self.count = 0
@@ -161,7 +172,12 @@ class AdamW(OnlineLearner):
         M_hat = self.M/(1.0-self.beta1**self.count)
         V_hat = self.V/(1.0-self.beta2**self.count)
 
-        self.iterate = -self.warmed_up_lr * (M_hat/ (torch.sqrt(V_hat) + self.epsilon) + self.wd * self.param)
+        if self.normalize == 'normalize':
+            norm_factor = 1.0/(torch.linalg.norm(M_hat/ (torch.sqrt(V_hat) + self.epsilon)) + self.epsilon)
+        else:
+            norm_factor = 1.0
+
+        self.iterate = -self.warmed_up_lr * (M_hat/ (torch.sqrt(V_hat) + self.epsilon) * norm_factor + self.wd * self.param)
 
     def get_logging_info(self, aux=None):
         return {
@@ -184,6 +200,8 @@ class PerTensorScaleAdamW(OnlineLearner):
         self.V = torch.zeros_like(self.iterate)
 
         self.scale_learner = ExpMD(config, device=param.device)
+
+        self.normalize = config.get('adamw_normalize', 'none')
 
         self.epsilon = config.get('epsilon', SMALL_VALUE)
 
@@ -222,7 +240,12 @@ class PerTensorScaleAdamW(OnlineLearner):
         M_hat = self.M/(1.0-self.beta1**self.count)
         V_hat = self.V/(1.0-self.beta2**self.count)
 
-        self.iterate = -self.scale_learner.get_iterate() * self.warmed_up_lr * (M_hat/ (torch.sqrt(V_hat) + self.epsilon) + self.wd * self.param)
+        if self.normalize == 'normalize':
+            norm_factor = 1.0/(torch.linalg.norm(M_hat/ (torch.sqrt(V_hat) + self.epsilon)) + self.epsilon)
+        else:
+            norm_factor = 1.0
+
+        self.iterate = -self.scale_learner.get_iterate() * self.warmed_up_lr * (M_hat/ (torch.sqrt(V_hat) + self.epsilon) * norm_factor + self.wd * self.param)
 
     def get_logging_info(self, aux=None):
         max_lr = max((self.warmed_up_lr * self.scale_learner.get_iterate()).item(), 
@@ -261,6 +284,8 @@ class GlobalScaleAdamW(OnlineLearner):
         self.warmed_up_lr = 0.0
 
         self.scale_learner = ExpMD(config, device=device)
+
+        self.normalize = config.get('adamw_normalize', 'none')
 
         self.epsilon = config.get('epsilon', SMALL_VALUE)
 
@@ -306,7 +331,12 @@ class GlobalScaleAdamW(OnlineLearner):
             M_hat = state['M']/(1.0-self.beta1**self.count)
             V_hat = state['V']/(1.0-self.beta2**self.count)
 
-            state['iterate'] = -self.scale_learner.get_iterate() * self.warmed_up_lr * (M_hat/ (torch.sqrt(V_hat) + self.epsilon) + self.wd * param)
+            if self.normalize == 'normalize':
+                norm_factor = 1.0/(torch.linalg.norm(M_hat/ (torch.sqrt(V_hat) + self.epsilon)) + self.epsilon)
+            else:
+                norm_factor = 1.0
+
+            state['iterate'] = -self.scale_learner.get_iterate() * self.warmed_up_lr * (M_hat/ (torch.sqrt(V_hat) + self.epsilon) * norm_factor + self.wd * param)
         
     def get_iterate(self):
         return self.state
@@ -342,9 +372,10 @@ class PerTensorRandomOL(torch.optim.Optimizer):
 
         self.state['reward'] = 0.0
 
-    def offset_correlation(self):
+    def offset_correlation(self, loss_difference=None):
         correlations = {}
         total_correlation = 0.0
+
         for group in self.param_groups:
             for param in group['params']:
 
@@ -358,13 +389,18 @@ class PerTensorRandomOL(torch.optim.Optimizer):
                 correlations[param] = correlation
                 total_correlation += correlation
 
+        if loss_difference is not None:
+            for param in correlations:
+                correlations[param].mul_(-loss_difference/total_correlation)
+            total_correlation = -loss_difference
+
         return correlations, total_correlation
 
 
 
     
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(self, loss_difference=None, closure=None):
 
         self.count += 1
         logging_info = {}
@@ -379,7 +415,7 @@ class PerTensorRandomOL(torch.optim.Optimizer):
             scaling = -np.log(1.0-random.random())
 
 
-        correlations, total_correlation = self.offset_correlation()
+        correlations, total_correlation = self.offset_correlation(loss_difference)
         self.state['reward'] -= total_correlation
 
         logging_info.update({
@@ -409,11 +445,11 @@ class PerTensorRandomOL(torch.optim.Optimizer):
                 logging_info.update(state['ol'].get_logging_info(logging_info))
 
         
-        self.logger.log(
-            logging_info,
-            commit=False
-        )
-
+        # self.logger.log(
+        #     logging_info,
+        #     commit=False
+        # )
+        return logging_info
         
 
         
@@ -469,13 +505,18 @@ class GlobalRandomOL(torch.optim.Optimizer):
 
                 total_correlation += correlation
 
+        if loss_difference is not None:
+            for param in correlations:
+                correlations[param]['correlation'].mul_(-loss_difference/total_correlation)
+            total_correlation = -loss_difference
+
         return correlations, total_correlation
 
 
 
     
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(self, loss_difference=None, closure=None):
 
         self.count += 1
         logging_info = {}
@@ -490,7 +531,7 @@ class GlobalRandomOL(torch.optim.Optimizer):
             scaling = -np.log(1.0-random.random())
 
 
-        cors_and_grads, total_correlation = self.offset_cors_and_grads()
+        cors_and_grads, total_correlation = self.offset_cors_and_grads(loss_difference)
         self.state['reward'] -= total_correlation
 
         logging_info.update({
@@ -515,10 +556,12 @@ class GlobalRandomOL(torch.optim.Optimizer):
 
         logging_info.update(self.ol.get_logging_info(logging_info))          
 
-        self.logger.log(
-            logging_info,
-            commit=False
-        )
+        # self.logger.log(
+        #     logging_info,
+        #     commit=False
+        # )
+
+        return logging_info
 
         
 

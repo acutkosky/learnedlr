@@ -100,6 +100,8 @@ class Trainer:
             self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.wd, betas=(config.beta1, config.beta2))
         elif self.config.optimizer == 'pertensor_randomol':
             self.optimizer = onlineopt.PerTensorRandomOL(model.parameters(), config=config, logger=wandb)
+        elif self.config.optimizer == 'global_randomol':
+            self.optimizer = onlineopt.GlobalRandomOL(model.parameters(), config=config, logger=wandb)
         # self.losses = []
 
 
@@ -161,7 +163,7 @@ class Trainer:
                     features, loss, accuracy = model(idx, mask, labels)
                 return features, loss, accuracy
 
-            if config.log_differences:
+            if config.log_differences or config.correct_inner_products:
                 with self.swap_manager.swap(previous_parameters):
                     features, prev_loss, accuracy = inference()
                 
@@ -179,7 +181,16 @@ class Trainer:
 
             features, loss, accuracy = get_loss()
 
-            total_reward = self.optimizer.step()
+            if 'randomol' in config.optimizer and config.correct_inner_products:
+                step_data = loss_difference
+            else:
+                step_data = None
+
+            log_data = self.optimizer.step(step_data)
+
+            if log_data is not None and 'randomol' in config.optimizer:
+                log_dict.update(log_data)
+
             self.tokens += (mask >= 0).sum()
 
 
@@ -215,8 +226,8 @@ class Trainer:
                         "it_per_second": 1.0/delta_time,
                         "examples": self.examples,
                     })
-                if config.log_differences and config.optimizer == 'randomol':
-                    log_dict["optimizer/measured_minus_estimate"] = total_difference - total_reward
+                # if config.log_differences and 'randomol' in config.optimizer:
+                #     log_dict["optimizer/measured_minus_estimate"] = self.total_difference - total_reward
 
                 wandb.log(log_dict, step = self.iterations)
 
