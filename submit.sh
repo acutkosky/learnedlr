@@ -20,7 +20,8 @@
 #send email at the end
 #$ -m e
 
-
+# assuming we are in runs/ here:
+cd ..
 
 module load python3 pytorch tensorflow
 source env/bin/activate

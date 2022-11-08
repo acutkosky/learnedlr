@@ -9,6 +9,8 @@ RUNFILE=submit.sh.`date +%N`
 
 cp submit.sh runs/$RUNFILE
 
+echo "creating runs/$RUNFILE"
+
 cd runs
 
 qsub $RUNFILE $@

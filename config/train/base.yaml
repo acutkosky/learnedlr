@@ -20,7 +20,12 @@ epsilon: 1e-8 # small value originally for numerical precision issues that actua
 expmd_min: 1e-10 # minimum value for the exponential updates md with optimal dynamic regret algorithm.
 expmd_max: 1e-2 # maximum value for exponential updates md algorithm.
 
-expmd_sum_vs_mean: 'sum'
+expmd_sum_vs_mean: 'sum' # whether to aggregate by sum of mean in the param free alg.
+expmd_post_agg_clip: false # whether to use the constraint set reduction
+
+expmd_initial_value: 1e-8 # initial value for base learners in expmd
+
+
 correct_inner_products: false # whether to rescale gradient inner products to be equal to actual loss differences.
 ##########
 

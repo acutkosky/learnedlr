@@ -66,10 +66,12 @@ class ExpMD(OnlineLearner):
 
         self.sum_mean = config.get('expmd_sum_vs_mean', 'sum')
 
+        self.post_agg_clip = config.get('expmd_post_agg_clip', False)
+
         self.max_grad = torch.zeros(1, device=device)
         self.max_grad_beta = 0.99
 
-        self.sub_iterates = torch.ones_like(self.lrs) * 1e-8
+        self.sub_iterates = torch.ones_like(self.lrs) * config.get('expmd_initial_value', 1e-8)
 
         self.count = 0.0
 
@@ -78,14 +80,30 @@ class ExpMD(OnlineLearner):
 
     def get_iterate(self):
         if self.sum_mean == 'sum':
-            return torch.sum(self.sub_iterates)
+            iterate = torch.sum(self.sub_iterates)
         else:
-            return torch.mean(self.sub_iterates)
+            iterate = torch.mean(self.sub_iterates)
+
+        if self.post_agg_clip:
+            iterate.clamp_(min=self.min_value, max=self.max_value)
+
+        return iterate
+
 
 
     def update(self, grad):
 
         self.count += 1.0
+
+        # perform 1d constraint reduction if required:
+        if self.post_agg_clip:
+            # ignore gradients that push us further outside the bound
+            iterate = self.get_iterate()
+            if iterate == self.max_value and grad < 0:
+                return
+            if iterate == self.min_value and grad > 0:
+                return
+            
         
         # max_grad = self.max_grad/(1.0 - self.max_grad_beta**self.count)
         # orig_grad = grad
