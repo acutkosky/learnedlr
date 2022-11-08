@@ -485,7 +485,7 @@ class GlobalRandomOL(torch.optim.Optimizer):
 
         self.state['reward'] = 0.0
 
-    def offset_cors_and_grads(self):
+    def offset_cors_and_grads(self, loss_difference=None):
         correlations = {}
         total_correlation = 0.0
         for group in self.param_groups:
