@@ -91,7 +91,7 @@ class ResidualSelfAttention(torch.nn.Module):
         
         if self.config.use_fc:
             y = self.fc1(y)
-            y = F.relu(y)
+            y = F.gelu(y)
             y = self.fc2(y)
 
         y = x + y#*self.scaling#*(1-self.residual_weight) + self.residual_weight*y
