@@ -77,6 +77,9 @@ class ResidualSelfAttention(torch.nn.Module):
         self.diagnorm = condnorm.DiagNorm(momentum=0.0001, ignore_dims=[1])
         self.ln = torch.nn.LayerNorm(config.embedding_dim)
         self.scaling = torch.nn.Parameter(torch.zeros(1))
+
+        self.fc1 = torch.nn.Linear(config.embedding_dim, 2*config.embedding_dim)
+        self.fc2 = torch.nn.Linear(2*config.embedding_dim, config.embedding_dim)
         # self.register_parameter("residual_weight", 
         # self.residual_weight = torch.nn.Parameter(torch.tensor(0.0))
 
@@ -85,6 +88,12 @@ class ResidualSelfAttention(torch.nn.Module):
             y = self.diagnorm(x)
         y = self.ln(x)
         y = self.selfattention(y)
+        
+        if self.config.use_fc:
+            y = self.fc1(y)
+            y = F.relu(y)
+            y = self.fc2(y)
+
         y = x + y#*self.scaling#*(1-self.residual_weight) + self.residual_weight*y
         return y
 

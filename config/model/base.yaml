@@ -2,4 +2,5 @@ embedding_dim: 1024
 n_layers: 12
 n_heads: 4
 context_length: 10
-use_diag: True
+use_diag: False
+use_fc: False

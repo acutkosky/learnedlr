@@ -99,7 +99,7 @@ class Trainer:
         if self.config.optimizer == 'adamw':
             self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.wd, betas=(config.beta1, config.beta2))
         elif self.config.optimizer == 'pertensor_randomol':
-            self.optimizer = onlineopt.PerTensorRandomOL(model.parameters(), config=config, logger=wandb)
+            self.optimizer = onlineopt.PerTensorRandomOL(model.parameters(), config=config, named_params=self.model.named_parameters(), logger=wandb)
         elif self.config.optimizer == 'global_randomol':
             self.optimizer = onlineopt.GlobalRandomOL(model.parameters(), config=config, logger=wandb)
         # self.losses = []

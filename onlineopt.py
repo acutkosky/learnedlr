@@ -265,15 +265,27 @@ class PerTensorScaleAdamW(OnlineLearner):
 
         self.iterate = -self.scale_learner.get_iterate() * self.warmed_up_lr * (M_hat/ (torch.sqrt(V_hat) + self.epsilon) * norm_factor + self.wd * self.param)
 
-    def get_logging_info(self, aux=None):
-        max_lr = max((self.warmed_up_lr * self.scale_learner.get_iterate()).item(), 
-            aux.get('optimizer/max_learned_lr', 0.0))
-        min_lr = min((self.warmed_up_lr * self.scale_learner.get_iterate()).item(),
-            aux.get('optimizer/min_learned_lr', 100.0))
-        return {
+    def get_logging_info(self, aux):
+        lr = (self.warmed_up_lr * self.scale_learner.get_iterate()).item()
+        past_info = aux['log_info']
+        param_names = aux['param_names']
+        max_lr = max(lr, 
+            past_info.get('optimizer/max_learned_lr', 0.0))
+        min_lr = min(lr,
+            past_info.get('optimizer/min_learned_lr', 100.0))
+        param_name = param_names.get(self.param, None)
+
+        log_info = {
             'optimizer/max_learned_lr': max_lr,
-            'optimizer/min_learned_lr': min_lr
+            'optimizer/min_learned_lr': min_lr,
         }
+
+        if param_name is not None:
+            log_info.update({
+                f'per_tensor_lrs/{param_name}': lr,
+            })
+
+        return log_info
 
 
 
@@ -367,13 +379,19 @@ class GlobalScaleAdamW(OnlineLearner):
 
 class PerTensorRandomOL(torch.optim.Optimizer):
 
-    def __init__(self, params, config, logger, **kwargs):
+    def __init__(self, params, config, logger, named_params=None, **kwargs):
         
         super().__init__(params, kwargs)
 
         self.config = config
         self.logger = logger
         self.count = 0
+
+        self.param_names = {}
+
+        if named_params is not None:
+            for name, param in named_params:
+                self.param_names[param] = name
 
         self.__setstate__(self.state)
 
@@ -460,7 +478,10 @@ class PerTensorRandomOL(torch.optim.Optimizer):
                     param.add_(state['offset'], alpha=scaling)
                     state['iterate'].copy_(param)
 
-                logging_info.update(state['ol'].get_logging_info(logging_info))
+                logging_info.update(state['ol'].get_logging_info({
+                    'log_info': logging_info,
+                    'param_names': self.param_names,
+                    }))
 
         
         # self.logger.log(

@@ -1,6 +1,6 @@
 train:
   optimizer: adamw
-  warmup_examples: 512000
+  warmup_examples: 4096000
   lr: 1e-4
   beta1: 0.9
   beta2: 0.99
