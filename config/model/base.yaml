@@ -3,4 +3,4 @@ n_layers: 12
 n_heads: 4
 context_length: 10
 use_diag: False
-use_fc: False
+use_fc: True

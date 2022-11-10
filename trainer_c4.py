@@ -16,6 +16,9 @@ from optional_module import optional_module
 import c4_loader
 import wandb
 
+
+import gc
+
 parser = argparse.ArgumentParser(description='Simple pretraining thing')
 
 parser.add_argument('--config', type=str, default='config/default.yaml')
@@ -139,6 +142,8 @@ class Trainer:
 
         previous_parameters = get_param_copy(self.model)
 
+
+    
         for t, strings in pbar:
             cur_run_it += 1
             # print(strings)
@@ -161,6 +166,8 @@ class Trainer:
                 # this function is faster than get_loss() but does not allow computing gradients
                 with torch.no_grad():
                     features, loss, accuracy = model(idx, mask, labels)
+                
+
                 return features, loss, accuracy
 
             if config.log_differences or config.correct_inner_products:
@@ -175,7 +182,7 @@ class Trainer:
                 log_dict.update({
                         'optimizer/loss_difference': loss_difference,
                         'optimizer/total_loss_difference': self.total_difference,
-                    })     
+                    })
 
             update_param_copy_(model, previous_parameters)
 
