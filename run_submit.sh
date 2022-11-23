@@ -5,7 +5,7 @@
 mkdir -p runs/
 
 
-RUNFILE=submit.sh.`date +%N`
+RUNFILE=submit.sh.`date +%s%N`
 
 cp submit.sh runs/$RUNFILE
 

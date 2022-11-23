@@ -35,8 +35,9 @@ context_length: 10
 num_workers: 4 # number of workers to use for loading each dataset (you might need this to be 1/2 the number of CPUs since there is both train and test, even though technically they are not needed at the same time.)
 batch_size: 1024 
 valid_frequency_examples: 409600 # how many training examples to process between computing validation performance (training set is too big to actually pass all the way through even once)
-valid_examples: 102400 # how many examples to use for validation (validation set is pretty big, so we just subsample by looping through it when computing validation stats)
+valid_examples: 51200 # how many examples to use for validation (validation set is pretty big, so we just subsample by looping through it when computing validation stats)
 epochs: 200
+total_examples: 20480000 # when this is specified, it will OVERRIDE the epochs to be epochs=total_examples / valid_frequency_examples
 ministeps: 1 #number of steps to do on a particular minibatch before moving to next one
 
 

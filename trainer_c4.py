@@ -15,6 +15,7 @@ from omegaconf.errors import ConfigAttributeError
 from optional_module import optional_module
 import c4_loader
 import wandb
+import numpy as np
 
 
 import gc
@@ -98,11 +99,14 @@ class Trainer:
         self.tokenizer = tokenizer
 
         self.config.warmup_steps = self.config.warmup_examples // self.config.batch_size
+        self.config.total_steps = self.config.epochs *  self.config.valid_frequency_examples // self.config.batch_size
 
         if self.config.optimizer == 'adamw':
             self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.wd, betas=(config.beta1, config.beta2))
         elif self.config.optimizer == 'pertensor_randomol':
             self.optimizer = onlineopt.PerTensorRandomOL(model.parameters(), config=config, named_params=self.model.named_parameters(), logger=wandb)
+        elif self.config.optimizer == 'pertensor_residualol':
+            self.optimizer = onlineopt.PerTensorRandomResidualOL(model.parameters(), config=config, named_params=self.model.named_parameters(), logger=wandb)
         elif self.config.optimizer == 'global_randomol':
             self.optimizer = onlineopt.GlobalRandomOL(model.parameters(), config=config, logger=wandb)
         # self.losses = []
@@ -195,7 +199,7 @@ class Trainer:
 
             log_data = self.optimizer.step(step_data)
 
-            if log_data is not None and 'randomol' in config.optimizer:
+            if log_data is not None:
                 log_dict.update(log_data)
 
             self.tokens += (mask >= 0).sum()
@@ -215,8 +219,14 @@ class Trainer:
 
 
             if config.optimizer == 'adamw':
+
+                # cosine decay
+                if config.cosine_decay:
+                    lr = config.lr * np.cos(0.5 * np.pi * self.iterations/config.total_steps)
+                if config.linear_decay:
+                    lr = config.lr * (1.0 - self.iterations/config.total_steps)
                 # linear warmup
-                lr = config.lr * min(1, float(self.iterations) / float(max(1, config.warmup_steps)))
+                lr = lr * min(1, float(self.iterations) / float(max(1, config.warmup_steps)))
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = lr
                 if self.iterations % log_interval == 0:
@@ -246,7 +256,7 @@ class Trainer:
                 features, loss, accuracy = get_loss()
                 self.optimizer.step()
 
-            if (t+1) % iterations_per_epoch == 0:
+            if (t+1) % iterations_per_epoch == 0 or self.examples >= self.config.total_examples:
                 break
 
         wandb.log({
@@ -363,6 +373,7 @@ def initialize_and_train_model(config):
 
     model_config = config.model
     train_config = config.train
+
     tokenizer = transformers.GPT2Tokenizer.from_pretrained('gpt2')
 
     model_config.vocab_size = tokenizer.vocab_size
@@ -452,6 +463,13 @@ if __name__=='__main__':
             config.train = OmegaConf.merge(train_config, config.train)
         except ConfigAttributeError:
             config.train = train_config
+
+
+
+    if config.train.total_examples is not None:
+        # when total_examples is specified, then we use this to override epochs.
+        config.train.epochs = config.train.total_examples // config.train.valid_frequency_examples
+  
     
 
     # args = OmegaConf.create(vars(args))

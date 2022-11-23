@@ -1,0 +1,33 @@
+model:
+  embedding_dim: 768
+  n_layers: 12
+  n_heads: 4
+  context_length: 20
+  use_diag: False
+  use_fc: True
+train:
+  optimizer: adamw # current options: adamw, pertensor_randomol
+  wd: WEIGHT_DECAY
+
+  # generic options useful for all training algorithms
+  warmup_examples: 204800 # how many examples of linear warmup to perform
+  total_examples: 20480000
+  lr: LR # learning rate
+  beta1: 0.9 #beta values for adam algorithms
+  beta2: 0.99
+
+  linear_decay: LINEAR_DECAY
+  cosine_decay: COSINE_DECAY
+
+  # generic options for the trainer
+  num_workers: 3
+  batch_size: 1024
+  valid_frequency_examples: 409600 # how many training examples to process between computing validation performance (training set is too big to actually pass all the way through even once)
+  valid_examples: 51200 # how many examples to use for validation (validation set is pretty big, so we just subsample by looping through it when computing validation stats)
+
+
+  # options for wandb
+  log_differences: true
+  logging: true
+  wandb_project: C4_adamw_tuning
+  log_interval: 50

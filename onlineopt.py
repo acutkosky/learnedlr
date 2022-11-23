@@ -130,6 +130,165 @@ class ExpMD(OnlineLearner):
 
 
 
+
+class ExpMD_plusminus(OnlineLearner):
+    # This algorithm has an optimal dynamic regret guarantee
+    # which I cannot say for methods that actually choose a betting fraction intelligently (although it may be true)
+    def __init__(self, config, device, outer_learner=None, name='ExpMD_plusminus', **kwargs):
+        super().__init__(name, config, outer_learner)
+        self.lrs = torch.tensor([3**k for k in range(-15,5)], device=device)
+        self.min_value = config.get('expmd_min', 1e-10)
+        self.max_value = config.get('expmd_max', 1e-2)
+
+        self.sum_mean = config.get('expmd_sum_vs_mean', 'sum')
+
+        self.post_agg_clip = config.get('expmd_post_agg_clip', False)
+
+        self.max_grad = torch.zeros(1, device=device)
+        self.max_grad_beta = 0.99
+
+        self.sub_iterates_plus = torch.ones_like(self.lrs) * config.get('expmd_initial_value', 1e-8)
+        self.sub_iterates_minus = torch.ones_like(self.lrs) * config.get('expmd_initial_value', 1e-8)
+
+        self.count = 0.0
+
+
+        # self.iterate = torch.sum(self.sub_iterates)
+
+    def get_iterate(self):
+        if self.sum_mean == 'sum':
+            iterate = torch.sum(self.sub_iterates_plus) - torch.sum(self.sub_iterates_minus)
+        else:
+            iterate = torch.mean(self.sub_iterates_plus) - torch.mean(self.sub_iterates_minus)
+
+        if self.post_agg_clip:
+            iterate.clamp_(min=-1, max=self.max_value)
+
+        return iterate
+
+
+
+    def update(self, grad):
+
+        self.count += 1.0
+
+        # perform 1d constraint reduction if required:
+        if self.post_agg_clip:
+            # ignore gradients that push us further outside the bound
+            iterate = self.get_iterate()
+            if iterate == self.max_value and grad < 0:
+                return
+            if iterate == self.min_value and grad > 0:
+                return
+            
+        
+        # max_grad = self.max_grad/(1.0 - self.max_grad_beta**self.count)
+        # orig_grad = grad
+
+        # grad = torch.clamp(grad, -self.max_grad, self.max_grad)
+
+        # grad = grad/(self.max_grad + SMALL_VALUE)
+
+
+        # self.max_grad.mul_(self.max_grad_beta)
+        # self.max_grad.copy_(torch.max(torch.abs(orig_grad), self.max_grad))
+
+
+        self.sub_iterates_plus.mul_(torch.exp(-self.lrs*grad - (0.5 + 1.0/self.count)*self.lrs**2 * grad**2))
+        self.sub_iterates_minus.mul_(torch.exp(self.lrs*grad - (0.5 + 1.0/self.count)*self.lrs**2 * grad**2))
+
+        self.sub_iterates_plus.clamp_(min=self.min_value, max=self.max_value)
+        self.sub_iterates_minus.clamp_(min=self.min_value, max=self.max_value)
+
+        # self.iterate = torch.sum(self.sub_iterates)
+
+    def get_logging_info(self, aux=None):
+        param_name = aux['param_name']
+        return {
+            f'per_tensor_lrs/{param_name}': self.get_iterate()
+        }
+
+
+
+class ExpMD_twosided(OnlineLearner):
+    # This algorithm has an optimal dynamic regret guarantee
+    # which I cannot say for methods that actually choose a betting fraction intelligently (although it may be true)
+    def __init__(self, config, device, outer_learner=None, name='ExpMD_twosided', **kwargs):
+        super().__init__(name, config, outer_learner)
+        self.lrs = torch.tensor([3**k for k in range(-15,5)], device=device)
+        self.alphas = self.lrs
+        self.max_value = config.get('expmd_max', 1)
+        self.min_value = config.get('expmd_min', 1)
+
+        self.sum_mean = config.get('expmd_sum_vs_mean', 'sum')
+
+        self.post_agg_clip = config.get('expmd_post_agg_clip', False)
+
+        self.max_grad = torch.zeros(1, device=device)
+        self.max_grad_beta = 0.99
+
+        self.sub_iterates = torch.zeros_like(self.lrs)
+
+        self.count = 0.0
+
+
+        # self.iterate = torch.sum(self.sub_iterates)
+
+    def get_iterate(self):
+        if self.sum_mean == 'sum':
+            iterate = torch.sum(self.sub_iterates)
+        else:
+            iterate = torch.mean(self.sub_iterates)
+
+        if self.post_agg_clip:
+            iterate.clamp_(min=-self.min_value, max=self.max_value)
+
+        return iterate
+
+
+
+    def update(self, grad):
+
+        self.count += 1.0
+
+        # perform 1d constraint reduction if required:
+        if self.post_agg_clip:
+            # ignore gradients that push us further outside the bound
+            iterate = self.get_iterate()
+            if iterate == self.max_value and grad < 0:
+                return
+            if iterate == -self.min_value and grad > 0:
+                return
+            
+        theta = 2 * torch.sign(self.sub_iterates) *torch.log(torch.abs(self.sub_iterates)/self.alphas +1)/self.lrs - grad
+        self.sub_iterates.copy_(self.alphas *torch.sign(theta) 
+            * (
+                torch.exp(0.5 * self.lrs * torch.nn.functional.relu(
+                    torch.abs(theta) - 2 * self.lrs * grad**2
+                    ))
+                    - 1.0
+                ))
+        
+        self.sub_iterates.clamp_(min=-self.min_value, max=self.max_value)
+
+        # self.iterate = torch.sum(self.sub_iterates)
+
+    def get_logging_info(self, aux=None):
+        if aux is not None and 'param_name' in aux:
+            param_name = aux['param_name']
+            return {
+                f'per_tensor_lrs/{param_name}': self.get_iterate()
+            }
+        else:
+            return {
+                'optimizer/learned_lr': self.get_iterate()
+            }
+
+
+
+
+
+
 class OGD(OnlineLearner):
     def __init__(self, config, outer_learner, name='OGD', **kwargs):
         super().__init__(name, config, outer_learner)
@@ -145,6 +304,7 @@ class OGD(OnlineLearner):
 
     def get_iterate(self):
         return self.iterate
+
 
 
 class AdamW(OnlineLearner):
@@ -604,6 +764,124 @@ class GlobalRandomOL(torch.optim.Optimizer):
 
         
 
+
+class PerTensorRandomResidualOL(torch.optim.Optimizer):
+
+    def __init__(self, params, config, logger, named_params=None, **kwargs):
+        
+        super().__init__(params, kwargs)
+
+        self.config = config
+        self.logger = logger
+        self.count = 0
+
+        self.param_names = {}
+
+        if named_params is not None:
+            for name, param in named_params:
+                self.param_names[param] = name
+
+        self.__setstate__(self.state)
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+
+        for group in self.param_groups:
+            for param in group['params']:
+                state = self.state[param]
+                state['ol'] = META_OL_REGISTRY[self.config.ol.lower()](self.config, param.device, self)
+                state['opt'] = PER_TENSOR_OL_REGISTRY[self.config.opt.lower()](self.config, self, param)
+
+                state['iterate'] = param.clone().detach_()
+                state['offset'] = torch.zeros_like(param)
+
+        self.state['reward'] = 0.0
+
+    def offset_correlation(self, loss_difference=None):
+        correlations = {}
+        total_correlation = 0.0
+
+        for group in self.param_groups:
+            for param in group['params']:
+
+                if param.grad is None:
+                    continue
+
+                state = self.state[param]
+
+                
+                correlation = torch.sum(state['offset'] * param.grad)
+                correlations[param] = correlation
+                total_correlation += correlation
+
+        if loss_difference is not None:
+            for param in correlations:
+                correlations[param].mul_(-loss_difference/total_correlation)
+            total_correlation = -loss_difference
+
+        return correlations, total_correlation
+
+
+
+    
+    @torch.no_grad()
+    def step(self, loss_difference=None, closure=None):
+
+        self.count += 1
+        logging_info = {}
+
+        if self.config.scale_type == 'random':
+            scaling = random.random()
+        elif self.config.scale_type == 'half':
+            scaling = 0.5
+        elif self.config.scale_type == 'one':
+            scaling = 1.0
+        elif self.config.scale_type ==  'exp':
+            scaling = -np.log(1.0-random.random())
+
+
+        correlations, total_correlation = self.offset_correlation(loss_difference)
+        self.state['reward'] -= total_correlation
+
+        logging_info.update({
+            'optimizer/total_reward': self.state['reward'],
+            'optimizer/current_reward': -total_correlation,
+        })
+
+        for group in self.param_groups:
+            for param in group['params']:
+                if param.grad is None:
+                    continue
+                
+                state = self.state[param]
+
+
+                residual_grad = correlations[param]
+                state['ol'].update(residual_grad)
+                state['opt'].update(param.grad)
+
+                state['offset'].copy_(state['opt'].get_iterate())
+
+
+                param.add_((scaling*state['ol'].get_iterate() + 1.0)*state['offset'])
+
+
+                logging_info.update(state['opt'].get_logging_info())
+
+                logging_info.update(state['ol'].get_logging_info({
+                    'log_info': logging_info,
+                    'param_name': self.param_names[param],
+                    }))
+
+        
+        # self.logger.log(
+        #     logging_info,
+        #     commit=False
+        # )
+        return logging_info
+        
+
+        
         
 
 
@@ -616,6 +894,10 @@ PER_TENSOR_OL_REGISTRY = {
 
 GLOBAL_OL_REGISTRY = {
     'gscaleadamw': GlobalScaleAdamW,
+}
+
+META_OL_REGISTRY = {
+    'expmd_twosided': ExpMD_twosided,
 }
 
 
