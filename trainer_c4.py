@@ -221,10 +221,13 @@ class Trainer:
             if config.optimizer == 'adamw':
 
                 # cosine decay
+                lr = config.lr
                 if config.cosine_decay:
-                    lr = config.lr * np.cos(0.5 * np.pi * self.iterations/config.total_steps)
+                    lr = lr * np.cos(0.5 * np.pi * self.iterations/config.total_steps)
+                if config.true_cosine_decay:
+                    lr = lr *  0.5 * (1+ np.cos(np.pi * self.iterations/config.total_steps))
                 if config.linear_decay:
-                    lr = config.lr * (1.0 - self.iterations/config.total_steps)
+                    lr = lr * (1.0 - self.iterations/config.total_steps)
                 # linear warmup
                 lr = lr * min(1, float(self.iterations) / float(max(1, config.warmup_steps)))
                 for param_group in self.optimizer.param_groups:

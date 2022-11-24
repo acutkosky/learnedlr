@@ -7,17 +7,18 @@ model:
   use_fc: True
 train:
   optimizer: adamw # current options: adamw, pertensor_randomol
-  wd: WEIGHT_DECAY
+  wd: +WEIGHT_DECAY
 
   # generic options useful for all training algorithms
   warmup_examples: 204800 # how many examples of linear warmup to perform
   total_examples: 20480000
-  lr: LR # learning rate
+  lr: +LR # learning rate
   beta1: 0.9 #beta values for adam algorithms
   beta2: 0.99
 
-  linear_decay: LINEAR_DECAY
-  cosine_decay: COSINE_DECAY
+  linear_decay: +LINEAR_DECAY
+  cosine_decay: +COSINE_DECAY
+  true_cosine_decay: +TRUE_COSINE_DECAY
 
   # generic options for the trainer
   num_workers: 3
