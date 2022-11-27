@@ -146,15 +146,24 @@ class Trainer:
 
         previous_parameters = get_param_copy(self.model)
 
+        
+
 
     
         for t, strings in pbar:
             cur_run_it += 1
             # print(strings)
             # encoded = tokenizer(strings, padding=True, truncation=True, return_tensors='pt', max_length=model.config.context_length)
+            
+            # num_tokens = strings['input_ids'].numel()
+
+            # self.total_tokens += num_tokens
+
             idx = strings['input_ids'].to(self.device)
             mask = strings['attention_mask'].to(self.device)
             labels = strings['labels'].to(self.device)
+
+            
 
             log_interval = config.get('log_interval', 100)
             log_dict = {}
@@ -222,11 +231,11 @@ class Trainer:
 
                 # cosine decay
                 lr = config.lr
-                if config.cosine_decay:
+                if config.decay_type == 'half_cosine':
                     lr = lr * np.cos(0.5 * np.pi * self.iterations/config.total_steps)
-                if config.true_cosine_decay:
+                if config.decay_type == 'true_cosine':
                     lr = lr *  0.5 * (1+ np.cos(np.pi * self.iterations/config.total_steps))
-                if config.linear_decay:
+                if config.decay_type == 'linear':
                     lr = lr * (1.0 - self.iterations/config.total_steps)
                 # linear warmup
                 lr = lr * min(1, float(self.iterations) / float(max(1, config.warmup_steps)))
@@ -245,6 +254,7 @@ class Trainer:
                         "train/accuracy": accuracy.item(),
                         "it_per_second": 1.0/delta_time,
                         "examples": self.examples,
+                        "tokens": self.tokens,
                     })
                 # if config.log_differences and 'randomol' in config.optimizer:
                 #     log_dict["optimizer/measured_minus_estimate"] = self.total_difference - total_reward

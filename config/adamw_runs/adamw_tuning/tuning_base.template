@@ -10,15 +10,17 @@ train:
   wd: +WEIGHT_DECAY
 
   # generic options useful for all training algorithms
-  warmup_examples: 204800 # how many examples of linear warmup to perform
-  total_examples: 20480000
+  warmup_examples: +WARMUP_EXAMPLES # how many examples of linear warmup to perform
+  total_examples: 12288000
   lr: +LR # learning rate
   beta1: 0.9 #beta values for adam algorithms
   beta2: 0.99
 
-  linear_decay: +LINEAR_DECAY
-  cosine_decay: +COSINE_DECAY
-  true_cosine_decay: +TRUE_COSINE_DECAY
+  linear_decay: False
+  cosine_decay: False
+  true_cosine_decay: False
+
+  decay_type: +DECAY_TYPE
 
   # generic options for the trainer
   num_workers: 3
@@ -28,7 +30,7 @@ train:
 
 
   # options for wandb
-  log_differences: true
+  log_differences: false
   logging: true
-  wandb_project: C4_adamw_tuning
+  wandb_project: C4_adamw_tuning_12M
   log_interval: 50

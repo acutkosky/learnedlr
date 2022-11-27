@@ -1,3 +1,7 @@
+model:
+  embedding_dim: 1024
+  n_layers: 12
+  n_heads: 4
 train:
   optimizer: adamw # current options: adamw, pertensor_randomol
 
