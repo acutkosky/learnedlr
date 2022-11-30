@@ -3,7 +3,7 @@
 To setup on SCC, first load modules:
 
 ```
-module load python3 pytorch tensorflow
+module load python3 pytorch tensorflow jax
 ```
 
 Now, setup virtual environment:
@@ -11,6 +11,7 @@ Now, setup virtual environment:
 ```
 [ ! -d "env" ] && virtualenv env
 source env/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
