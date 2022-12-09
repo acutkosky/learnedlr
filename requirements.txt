@@ -1,5 +1,6 @@
+-f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html # seems like jax install doesn't work right without this...
 torch
-jax
+jax[cuda]>=0.3.0 # the SCC's jax module is 0.2.19, so let's get at least 0.3
 transformers
 datasets
 omegaconf

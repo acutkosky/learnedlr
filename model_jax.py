@@ -141,9 +141,8 @@ class StackedAttention(nn.Module):
 
         self.features = nn.Sequential([ResidualSelfAttention(config) for _ in range(config.n_layers)])
         self.tok_embeddings = nn.Embed(config.vocab_size, config.embedding_dim)
-        self.pos_embeddings = self.variable('constants',
-                                       'position_embedding',
-                                       lambda : jnp.zeros((1, config.context_length, config.embedding_dim)))
+        self.pos_embeddings = self.param('position_embedding',
+                                         lambda : jnp.zeros((1, config.context_length, config.embedding_dim)))
         self.head = nn.Dense(config.vocab_size,
                         kernel_init=jax.nn.initializers.zeros,
                         bias_init=jax.nn.initializers.zeros)

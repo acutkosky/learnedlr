@@ -16,7 +16,10 @@ from optional_module import optional_module
 import c4_loader
 import wandb
 import numpy as np
-
+import jax
+import optax
+from jax import numpy as jnp
+from dataclasses import dataclass
 
 import gc
 
@@ -26,6 +29,69 @@ parser.add_argument('--config', type=str, default='config/default.yaml')
 parser.add_argument('--model_config', type=str, default='config/model/base.yaml')
 parser.add_argument('--train_config', type=str, default='config/train/base.yaml')
 
+
+# flax has it's own train_state thing, but I am too lazy to figure out what it does, so I'm just
+# going to implement my own here:
+@dataclass
+class TrainState:
+    model: Any = None
+    optimizer: Any = None
+    params: Any = None
+
+    def __init__(self, rng, model=None, optimizer=None, model_state=None, opt_state=None, dummy_input=None):
+        '''
+        rng: jax psuedo-random number generator
+        dummy_input: flax requires you to trace through the module with some input of the 
+            correct shape before actually initializing anything. It seems dumb to me, but
+            probably not worth reimplementing things for.
+        '''
+        self.rng = rng
+        self.model = model
+        self.optimizer = optimizer
+        self.model_state = model_state
+        self.opt_state = opt_state
+        self.dummy_input = dummy_input
+
+
+        if model_state is None and dummy_input is not None:
+            self.model_state = model.init(rng, dummy_input)
+
+        if self.opt_state is None and self.model_state is not None:
+            self.opt_state = self.optimizer.init(self.model_state)
+        
+
+    @jax.jit
+    def update(self, value, grads):
+
+        self.opt_state = self.optimizer.update(value, grads, self.model_state, self.opt_state)
+        self.model_state = self.optimizer.apply_update(self.model_state, self.opt_state)
+        return self
+
+    def _tree_flatten(self):
+
+        children = (self.rng, self.model_state, self.opt_state, self.dummy_input)
+        static_values = {
+            'model': self.model,
+            'optimizer': self.optimizer
+        }
+        return children, static_values,
+
+    @classmethod
+    def _tree_unflatten(cls, children, static_values):
+
+        rng, model_state, opt_state, dummy_input = children
+
+        return cls(rng=rng, model_state=model_state, opt_state=opt_state, dummy_input=dummy_input, **static_values)
+
+jax.tree_util.register_pytree_node(
+    TrainState,
+    TrainState._tree_flatten,
+    TrainState._tree_unflatten
+)
+
+
+
+    
 
 
 # context manager for swapping variables in a model:
@@ -101,14 +167,18 @@ class Trainer:
         self.config.warmup_steps = self.config.warmup_examples // self.config.batch_size
         self.config.total_steps = self.config.epochs *  self.config.valid_frequency_examples // self.config.batch_size
 
-        if self.config.optimizer == 'adamw':
-            self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.wd, betas=(config.beta1, config.beta2))
-        elif self.config.optimizer == 'pertensor_randomol':
-            self.optimizer = onlineopt.PerTensorRandomOL(model.parameters(), config=config, named_params=self.model.named_parameters(), logger=wandb)
-        elif self.config.optimizer == 'pertensor_residualol':
-            self.optimizer = onlineopt.PerTensorRandomResidualOL(model.parameters(), config=config, named_params=self.model.named_parameters(), logger=wandb)
-        elif self.config.optimizer == 'global_randomol':
-            self.optimizer = onlineopt.GlobalRandomOL(model.parameters(), config=config, logger=wandb)
+        if self.config.framework == 'pytorch':
+            if self.config.optimizer == 'adamw':
+                self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.wd, betas=(config.beta1, config.beta2))
+            elif self.config.optimizer == 'pertensor_randomol':
+                self.optimizer = onlineopt.PerTensorRandomOL(model.parameters(), config=config, named_params=self.model.named_parameters(), logger=wandb)
+            elif self.config.optimizer == 'pertensor_residualol':
+                self.optimizer = onlineopt.PerTensorRandomResidualOL(model.parameters(), config=config, named_params=self.model.named_parameters(), logger=wandb)
+            elif self.config.optimizer == 'global_randomol':
+                self.optimizer = onlineopt.GlobalRandomOL(model.parameters(), config=config, logger=wandb)
+        elif self.config.framework == 'jax':
+            if self.config.optimizer == 'adamw':
+                self.optimizer = optax.adamw(lr=config.lr)
         # self.losses = []
 
 
@@ -159,29 +229,40 @@ class Trainer:
 
             # self.total_tokens += num_tokens
 
-            idx = strings['input_ids'].to(self.device)
-            mask = strings['attention_mask'].to(self.device)
-            labels = strings['labels'].to(self.device)
+            if config.framework == 'pytorch':
+                idx = strings['input_ids'].to(self.device)
+                mask = strings['attention_mask'].to(self.device)
+                labels = strings['labels'].to(self.device)
+            elif config.framework == 'jax':
+                idx = jnp.array(strings['input_ids'])
+                mask = jnp.array(strings['attention_mask'])
+                labels = jnp.array(strings['labels'])
 
             
 
             log_interval = config.get('log_interval', 100)
             log_dict = {}
 
-            def get_loss():
+            def get_loss_torch():
                 # this function computes gradients
                 model.zero_grad()
                 features, loss, accuracy = model(idx, mask, labels)
                 loss.backward()
                 return features, loss, accuracy
+            
+            def get_loss_jax():
 
-            def inference():
+
+            def inference_torch():
                 # this function is faster than get_loss() but does not allow computing gradients
                 with torch.no_grad():
                     features, loss, accuracy = model(idx, mask, labels)
                 
 
                 return features, loss, accuracy
+
+            def inference_jax():
+                features, loss, accuracy = train_state.model.app
 
             if config.log_differences or config.correct_inner_products:
                 with self.swap_manager.swap(previous_parameters):
