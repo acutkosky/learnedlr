@@ -3,6 +3,19 @@ import torch
 import random
 import numpy as np
 
+from inspect import currentframe, getframeinfo
+
+LOGGING_ON = False
+
+def log(msg, *args, **kwargs):
+    if not LOGGING_ON:
+        return
+    
+    frameinfo = getframeinfo(currentframe().f_back)
+    print(f"[{frameinfo.filename} line: {frameinfo.lineno}] {msg}", *args, **kwargs)
+
+
+torch.autograd.set_detect_anomaly(True)
 
 class CopyWithGrad(torch.autograd.Function):
     '''
@@ -55,10 +68,26 @@ class MetaOpt(torch.optim.Optimizer):
         self.unnamed_buffers = []
 
         # lower order optimizers stored here
-        self.lower_opts = []
+        self.lower_opt = None
+        self.upper_opt = None
 
-
+        self.__setstate__(self.state)
         self.setup()
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+
+        for group in self.param_groups:
+            for param in group['params']:
+                state = self.state[param]
+                if '_meta_state' not in state:
+                    state['_meta_state'] = {}
+
+                state = state['_meta_state']
+
+                state['current_value'] = None
+                state['updated_value'] = None
+                state['current_grad'] = None
 
     def setup(self):
         # please define all the parameters here. If you define more later things may go wrong!
@@ -110,14 +139,20 @@ class MetaOpt(torch.optim.Optimizer):
         return module
     
 
-    def zero_grad(self):
+    def zero_grad(self, entry=None):
         super().zero_grad()
         for p in self.parameters():
             p.grad = None
-        for m in self.modules():
-            m.zero_grad()
-        for m in self.lower_opts:
-            m.zero_grad()
+        # for m in self.modules():
+        #     m.zero_grad()
+        if self.lower_opt is not None and entry != 'lower':
+            self.lower_opt.zero_grad(entry='upper')
+        if self.upper_opt is not None and entry != 'upper':
+            self.upper_opt.zero_grad(entry='lower')
+        # for m in self.lower_opts:
+        #     m.zero_grad()
+        # for m in self.upper_opts:
+        #     m.zero_grad()
 
 
 
@@ -132,36 +167,85 @@ class MetaOpt(torch.optim.Optimizer):
     def _step(self, *args, **kwargs):
         raise NotImplementedError
 
-
-    def step(self, *args, **kwargs):
-        print(f"running step at depth: {self.depth}")
+    def backward(self):
         for group in self.param_groups:
             for param in group['params']:
-                print(f"checking param: {param}")
+                log(f"checking param: {param}")
                 if param.grad is None:
                     continue
-                print(f"prepping param: {param} with grad: {param.grad}")
-                param.grad.detach_()
+
+                state = self.state[param]['_meta_state']
+
+                log(f"prepping param: {param} with grad: {param.grad}")
+                # param.grad.detach_()
+
+                if state['updated_value'] is not None:
+                    log(f"about to metagrad: updated value: {state['updated_value']} current_grad: {state['current_grad']} current_value: {state['current_value']}")
+                    state['updated_value'].backward(param.grad)
+                    # param.updated_value.backward(param.grad.detach())
+
+                # state['replicate'].backward(param.grad)
 
                 # save the current value (this seems hacky).. also no sure if the explicit copy here is needed.
-                param.current_value = param.detach()
+                state['current_value'] = param.clone().detach_()
+                state['current_grad'] = param.grad.clone().detach_()
+                # param.current_value = param.detach().clone()
+                # param.current_grad = param.grad.detach().clone()
+                log(f"after meta grad: current_grad: {state['current_grad']} current_value: {state['current_value']}")
 
                 param.detach_()
                 param.requires_grad = True
+
+    def step(self, entry=None, *args, **kwargs):
+        '''
+        entry: indicates whether this step was called by the user,
+            or is a recursive call. If user, entry=None
+            If recursive and was called by the upper_opt, then
+            entry='upper', else entry='lower'.
+        '''
+
+        log(f"running step at depth: {self.depth}")
+        
+        if entry is None:
+            # find the lowest model and do backprop.
+            opt_to_backward = self
+            while opt_to_backward.lower_opt is not None:
+                opt_to_backward  = opt_to_backward.lower_opt
+
+            while opt_to_backward is not None:
+                opt_to_backward.backward()
+                opt_to_backward = opt_to_backward.upper_opt
+
 
         
 
         # capture any return data
         self._step(*args, **kwargs)
 
+        # assert len(self.upper_opts) == 0 or len(self.lower_o pts) == 0
+
+        if self.upper_opt is not None and entry != 'upper':
+            self.upper_opt.step(entry='lower')
+        # for opt in self.upper_opts:
+            # opt.step()
+        
+
         for group in self.param_groups:
             for param in group['params']:
+                if param.grad is None:
+                    continue
                 # the params are not probably intermediate nodes, so we need to retain the grad.
-                param.retain_grad()
-
-        for opt in self.lower_opts:
-            opt.step()
+                log(f"copying param: {param}")
+                state = self.state[param]['_meta_state']
+                with torch.no_grad():
+                    param.copy_(state['updated_value'])#param.updated_value.clone())
+                    log(f"param now: {param} current_value: {state['current_value']}")
         
+
+        if self.lower_opt is not None and entry != 'lower':
+            self.lower_opt.step(entry='upper')
+        # for opt in self.lower_opts:
+        #     opt.step()
 
 def chain_meta_optimizers(params, to_chain, args=None, kwargs=None):
 
@@ -172,12 +256,35 @@ def chain_meta_optimizers(params, to_chain, args=None, kwargs=None):
 
     depth = 0
 
-    lower_opt = to_chain[0](params, *args[0], **kwargs[0], depth=depth)
+    first_opt = lower_opt = upper_opt = to_chain[0](params, *args[0], **kwargs[0], depth=depth)
 
     for opt, args_, kwargs_ in zip(to_chain[1:], args[1:], kwargs[1:]):
         depth += 1
         upper_opt = opt(lower_opt.parameters(), *args_, **kwargs_, depth=depth)
-        upper_opt.lower_opts.append(lower_opt)
+        lower_opt.upper_opt = upper_opt#s.append(upper_opt)
+        upper_opt.lower_opt = lower_opt
+        lower_opt = upper_opt
+
+    
+    return first_opt
+
+
+def reverse_chain_meta_optimizers(params, to_chain, args=None, kwargs=None):
+
+    if args is None:
+        args = [[] for _ in to_chain]
+    if kwargs is None:
+        kwargs = [{} for _ in to_chain]
+
+    depth = 0
+
+    first_opt = lower_opt = upper_opt = to_chain[0](params, *args[0], **kwargs[0], depth=depth)
+
+    for opt, args_, kwargs_ in zip(to_chain[1:], args[1:], kwargs[1:]):
+        depth += 1
+        upper_opt = opt(lower_opt.parameters(), *args_, **kwargs_, depth=depth)
+        upper_opt.lower_opt = lower_opt#s.append(lower_opt)
+        lower_opt.upper_opt = upper_opt
         lower_opt = upper_opt
 
     
@@ -186,11 +293,14 @@ def chain_meta_optimizers(params, to_chain, args=None, kwargs=None):
 
 ## subclasses:
 
+
 class SGD(MetaOpt):
 
-    def __init__(self, params, lr, wd=0.0, *args, **kwargs):
+    def __init__(self, params, lr, wd=0.0, min_bound=None, max_bound=None, *args, **kwargs):
         defaults = dict(lr=lr, wd=wd)
         super().__init__(params, defaults, *args, **kwargs)
+        self.min_bound = min_bound
+        self.max_bound = max_bound
 
         self.lr = self.register_parameter(torch.full((1,), lr, requires_grad=True))
 
@@ -201,20 +311,14 @@ class SGD(MetaOpt):
             for param in group['params']:
                 if param.grad is None:
                     continue
+                state = self.state[param]['_meta_state']
+                log(f"self.lr {self.lr}, current_value: {state['current_value']}, grad: {param.grad}")
 
-                print(f"doing sgd on param: {param}, grad: {param.grad}")
+                log(f"doing sgd on param: {param} (current value: {state['current_value']}), grad: {param.grad}")
 
-                new_param = param - self.lr * param.grad
+                state['updated_value'] = state['current_value'] - self.lr * state['current_grad']
+                if self.min_bound is not None or  self.max_bound is not None:
+                    state['updated_value'] = torch.clamp(state['updated_value'], self.min_bound, self.max_bound)
 
-                copy_with_grad(new_param, param)
+                log(f"new param: {state['updated_value']}")
 
-def generate():
-    a  = torch.tensor([1.0,2.0,3.0], requires_grad=True)
-    o = chain_meta_optimizers([a], [SGD, SGD], [[0.1], [0.2]])
-    return a, o
-def test(a, o):
-    b = torch.sum(a*a)
-    b.backward()
-    o.step()
-    o.zero_grad()
-    return a,o
