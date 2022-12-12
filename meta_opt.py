@@ -1,6 +1,6 @@
 
 import torch
-import random
+import functools
 import numpy as np
 
 from inspect import currentframe, getframeinfo
@@ -42,6 +42,51 @@ class CopyWithGrad(torch.autograd.Function):
 
 copy_with_grad = CopyWithGrad.apply
 
+
+class RandomUnitScale(torch.autograd.Function):
+    '''
+    uses random scaling to turn non-linear functions linear:
+    f(x) - f(0) = E[f'(sx) * x]
+    where s is uniform [0,1)
+    '''
+
+    scale = None
+
+    @staticmethod
+    def forward(ctx, to_scale):
+        if RandomUnitScale.scale is None:
+            RandomUnitScale.scale = torch.rand(1)
+        return to_scale * RandomUnitScale.scale
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        RandomUnitScale.scale = None
+        return grad_output
+
+rand_unit_scale = RandomUnitScale.apply
+
+class RandomExpScale(torch.autograd.Function):
+    '''
+    uses random scaling to turn non-linear functions linear.
+    using exponential distribution for s implies:
+    f(sx) - f(0) = E[f'(sx)*x]
+    '''
+
+    scale = None
+
+    @staticmethod
+    def forward(ctx, to_scale):
+        if RandomExpScale.scale is None:
+            RandomExpScale.scale = -torch.log(1.0 - torch.rand(1))
+
+        return to_scale * RandomExpScale.scale
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        RandomExpScale.scale = None
+        return grad_output
+
+rand_exp_scale = RandomExpScale.apply
 
 class MetaOpt(torch.optim.Optimizer):
 
@@ -296,11 +341,12 @@ def reverse_chain_meta_optimizers(params, to_chain, args=None, kwargs=None):
 
 class SGD(MetaOpt):
 
-    def __init__(self, params, lr, wd=0.0, min_bound=None, max_bound=None, *args, **kwargs):
+    def __init__(self, params, lr, wd=0.0, min_bound=None, max_bound=None, scaling=lambda x: x, *args, **kwargs):
         defaults = dict(lr=lr, wd=wd)
         super().__init__(params, defaults, *args, **kwargs)
         self.min_bound = min_bound
         self.max_bound = max_bound
+        self.scaling = scaling
 
         self.lr = self.register_parameter(torch.full((1,), lr, requires_grad=True))
 
@@ -316,9 +362,11 @@ class SGD(MetaOpt):
 
                 log(f"doing sgd on param: {param} (current value: {state['current_value']}), grad: {param.grad}")
 
-                state['updated_value'] = state['current_value'] - self.lr * state['current_grad']
+                state['updated_value'] = state['current_value'] - self.scaling(self.lr) * state['current_grad']
                 if self.min_bound is not None or  self.max_bound is not None:
                     state['updated_value'] = torch.clamp(state['updated_value'], self.min_bound, self.max_bound)
 
                 log(f"new param: {state['updated_value']}")
 
+SGD_unitscale = functools.partial(SGD, scaling=rand_unit_scale)
+SGD_expscale = functools.partial(SGD, scaling=rand_exp_scale)

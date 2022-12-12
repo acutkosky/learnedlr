@@ -390,3 +390,57 @@ def  test_reverse_positive_triple_sgd():
         0.050176,
         0.01
     )
+
+
+
+def test_unit_scale(count=1000):
+    rand_diff = 0
+    true_diff = 0
+    a = torch.randn(4, requires_grad=True)
+    b = torch.randn(4, requires_grad=True)
+    loss = lambda x,y: torch.sum(x*y) + torch.sum(torch.sin(x+y)**3)
+
+    z = loss(torch.zeros_like(a), torch.zeros_like(b))
+
+    for i in range(count):
+        sa = rand_unit_scale(a)
+        sb = rand_unit_scale(b)
+
+
+        l = loss(sa, sb)
+        l.backward()
+
+        rand_diff += torch.sum(a.grad * a) + torch.sum(b.grad * b)
+        true_diff += (loss(a,b) - z).item()
+
+        a.grad = None
+        b.grad = None
+
+    print(f"rand avg: {rand_diff/count}, true avg: {true_diff/count}")
+
+
+
+def test_exp_scale(count=1000):
+    rand_diff = 0
+    true_diff = 0
+    a = torch.randn(4, requires_grad=True)
+    b = torch.randn(4, requires_grad=True)
+    loss = lambda x,y: torch.sum(x*y) + torch.sum(torch.sin(x+y)**3)
+
+    z = loss(torch.zeros_like(a), torch.zeros_like(b))
+
+    for i in range(count):
+        sa = rand_exp_scale(a)
+        sb = rand_exp_scale(b)
+
+        
+        l = loss(sa, sb)
+        l.backward()
+
+        rand_diff += torch.sum(a.grad * a) + torch.sum(b.grad * b)
+        true_diff += (l - z).item()
+
+        a.grad = None
+        b.grad = None
+
+    print(f"rand avg: {rand_diff/count}, true avg: {true_diff/count}")
