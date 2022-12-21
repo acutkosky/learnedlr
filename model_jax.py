@@ -27,8 +27,8 @@ def Identity():
 # equivalent of torch masked_fill
 def masked_fill(to_fill, mask, fill):
     fill = jax.lax.broadcast(fill, to_fill.shape)
-    print(mask.shape)
-    print(to_fill.shape)
+    # print(mask.shape)
+    # print(to_fill.shape)
     mask = jax.lax.broadcast(mask, to_fill.shape)
     return jax.lax.select(mask, to_fill, fill)
 # class ModelConfig:
@@ -85,7 +85,7 @@ class SelfAttention(nn.Module):
         # print(query.shape)
 
         logits = jnp.matmul(key, rearrange(query, '... nh T hs -> ... nh hs T')) # [..., nh, T, hs] x [..., nh, hs, T] -> [..., nh, T, T]
-        masked_logits = jnp.where(mask.value, -jnp.inf, logits)
+        masked_logits = jnp.where(mask.value[:, :, :T, :T] == 0, -jnp.inf, logits)
         
         # masked_fill(logits, mask.value[:,:,:T,:T] == 0, float('-inf'))
 
@@ -137,15 +137,12 @@ class StackedAttention(nn.Module):
     def setup(self):
         config = self.config
 
-        config.vocab_size = 1000
-
         self.features = nn.Sequential([ResidualSelfAttention(config) for _ in range(config.n_layers)])
         self.tok_embeddings = nn.Embed(config.vocab_size, config.embedding_dim)
         self.pos_embeddings = self.param('position_embedding',
-                                         lambda : jnp.zeros((1, config.context_length, config.embedding_dim)))
-        self.head = nn.Dense(config.vocab_size,
-                        kernel_init=jax.nn.initializers.zeros,
-                        bias_init=jax.nn.initializers.zeros)
+                                         lambda rng : jnp.zeros((1, config.context_length, config.embedding_dim)))
+
+        self.head = nn.Dense(config.vocab_size, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.zeros)
         
     def get_targets(mask, idx, T):
         targets = idx[:,1:T+1]
@@ -153,9 +150,10 @@ class StackedAttention(nn.Module):
         # print(targets)
         return targets
 
-    def __call__(self, idx, labels, compute_loss=True):
+    def __call__(self, idx, mask, labels):
         """
         idx is 1-hot encoding integer tensor shape [B, T] entries are indices into vocab
+        mask: currently unused
         targets is 1-hot encoding integer tensor shape [B, T], entries are indices into vocab for labels.
             ith entry of bth row of targets is label for ith prefix of idx in bth example in the batch.
         """
@@ -167,14 +165,14 @@ class StackedAttention(nn.Module):
 
         tok_embd = self.tok_embeddings(idx[:, :T])
 
-        pos_embd = self.pos_embeddings.value[:, :T, :]
+        pos_embd = self.pos_embeddings[:, :T, :]
 
-        x = nn.softmax(tok_embd + pos_embd, axis=-1) # input for attention layers: shape [B, T, C]
+        attention_input = nn.softmax(tok_embd + pos_embd, axis=-1) # input for attention layers: shape [B, T, C]
 
-        features = self.features(x)
+        features = self.features(attention_input)
 
-        if not compute_loss:
-            return features
+        # if not compute_loss:
+        #     return features
 
         logits = self.head(features) # shape [B, T, V]
 
@@ -189,6 +187,9 @@ class StackedAttention(nn.Module):
         # print(f"logits for ce shape: {logits_for_CE.size()}, original logits shape: {logits.size()}, targets shape: {targets.size()}")
         targets_for_CE = targets.reshape(-1) # shape [BT]
 
+        # logits_for_CE = logits_for_CE[targets_for_CE != -100]
+        # targets_for_CE = targets_for_CE[targets_for_CE != -100]
+
         stopped_logits = jax.lax.stop_gradient(logits_for_CE)
         stopped_targets = jax.lax.stop_gradient(targets_for_CE)
 
@@ -202,105 +203,57 @@ class StackedAttention(nn.Module):
     #         num_correct = torch.sum(targets_for_CE == predictions)
     #         accuracy = num_correct/num_targets
 
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits_for_CE, targets_for_CE)
+        # loss = jnp.average(optax.softmax_cross_entropy_with_integer_labels(logits_for_CE, targets_for_CE))
+        loss = softmax_cross_entropy_with_integer_labels(logits_for_CE, targets_for_CE)
 
         return features, loss, accuracy        
                     
 
+# from omegaconf import OmegaConf
+# config = OmegaConf.load('config/meta_opt/offset_sgd.yaml').model
+# config.vocab_size = 1000
 
-    # def __init__(self, config):
-    #     super().__init__()
-    #     self.config = config
-    #     self.features = torch.nn.Sequential(*[ResidualSelfAttention(config) for _ in range(config.n_layers)])
-    #     self.tok_embeddings = torch.nn.Embedding(config.vocab_size, config.embedding_dim)
-    #     self.pos_embeddings = torch.nn.Parameter(torch.zeros(1, config.context_length, config.embedding_dim))
-    #     self.head = torch.nn.Linear(config.embedding_dim, config.vocab_size)
-    #     with torch.no_grad():
-    #         self.head.weight.mul_(0.0)
-    #         self.head.bias.mul_(0.0)
+# model = StackedAttention(config)
 
+# model_state= model.init(jax.random.PRNGKey(0), jnp.ones([2,10],dtype=int), jnp.full([2,10],False), jnp.ones([2,10], dtype=int))
 
-    # def get_targets(mask, idx, T):
-    #     targets = idx[:,1:T+1]
-    #     targets = targets.masked_fill(mask[:,1:T+1] == 0, -100)
-    #     # print(targets)
-    #     return targets
+# features, loss, accuracy = model.apply(model_state, jnp.zeros([1,50],dtype=int), jnp.full([1,50],False), jnp.ones([1,50], dtype=int))
+
+# # grad_fn = jax.grad(lambda *args: model.apply(*args)[1])
+
+# # grad = grad_fn(model_state, jnp.zeros([1,50],dtype=int), jnp.full([1,50],False), jnp.ones([1,50], dtype=int))
+
+# print(f"loss: {loss}, accuracy: {accuracy}")
 
 
-    # def forward(self, idx, mask, labels, compute_loss=True):
-    #     """
-    #     idx is 1-hot encoding integer tensor shape [B, T] entries are indices into vocab
-    #     targets is 1-hot encoding integer tensor shape [B, T], entries are indices into vocab for labels.
-    #         ith entry of bth row of targets is label for ith prefix of idx in bth example in the batch.
-    #     """
+def softmax_cross_entropy_with_integer_labels(logits, labels):
+    """Computes softmax cross entropy between sets of logits and integer labels.
+    Measures the probability error in discrete classification tasks in which
+    the classes are mutually exclusive (each entry is in exactly one class).
+    For example, each CIFAR-10 image is labeled with one and only one label:
+    an image can be a dog or a truck, but not both.
+    References:
+    [Goodfellow et al, 2016](http://www.deeplearningbook.org/contents/prob.html)
+    Args:
+    logits: Unnormalized log probabilities, with shape `[..., num_classes]`.
+    labels: Integers specifying the correct class for each input, with shape
+        `[...]`.
+    Returns:
+    Cross entropy between each prediction and the corresponding target
+    distributions, with shape `[...]`.
+    """
+    # This is like jnp.take_along_axis(jax.nn.log_softmax(...), ...) except that
+    # we avoid subtracting the normalizer from all values, just from the values
+    # for the correct labels.
+    logits_max = jnp.max(logits, axis=-1, keepdims=True)
+    logits -= jax.lax.stop_gradient(logits_max)
 
-    #     # x is 1-hot encoding
-    #     B, T = idx.size()
+    no_ignore = labels!=-100
 
-    #     T = min(T-1, self.config.context_length)
+    ignore_labels = jnp.where(no_ignore, labels, jnp.zeros_like(labels))
 
-    #     tok_embd = self.tok_embeddings(idx[:, :T])
+    total = jnp.sum(jax.lax.stop_gradient(no_ignore))
 
-    #     pos_embd = self.pos_embeddings[:, :T, :]
-
-    #     x = F.softmax(tok_embd + pos_embd, dim=-1) # input for attention layers: shape [B, T, C]
-
-    #     features = self.features(x)
-
-    #     if not compute_loss:
-    #         return features
-
-    #     logits = self.head(features) # shape [B, T, V]
-
-    #     targets = labels[:, :T]#
-    #     # targets = StackedAttention.get_targets(mask, idx, T)
-
-    #     # cross entropy loss doesn't know about T, so we flatten the time dimension:
-    #     # print("logits: ", logits.shape)
-    #     # print("targets: ", targets.shape)
-        
-    #     logits_for_CE = logits.reshape(-1, logits.size(-1)) # shape [BT, V]
-    #     # print(f"logits for ce shape: {logits_for_CE.size()}, original logits shape: {logits.size()}, targets shape: {targets.size()}")
-    #     targets_for_CE = targets.reshape(-1) # shape [BT]
-
-    #     with torch.no_grad():
-    #         predictions = torch.argmax(logits_for_CE, 1)
-    #         num_targets = torch.sum(targets_for_CE != -100)
-    #         num_correct = torch.sum(targets_for_CE == predictions)
-    #         accuracy = num_correct/num_targets
-
-    #     loss = F.cross_entropy(logits_for_CE, targets_for_CE)
-
-    #     return features, loss, accuracy
-
-
-
-
-# config = ModelConfig(vocab_size=4, context_length=3, num_layers=2, embedding_dim=4, n_heads=2)
-
-# l = StackedAttention(config)
-
-# idx = torch.tensor([ [2, 3, 0, 1],
-#                      [0, 1, 2, 3],
-#                      [3, 0, 1, 2],
-#                      [1, 2, 3, 0] ])
-
-# mask = 0*torch.tensor([[1, 1, 1, 1],
-#                      [1, 1, 1, 1],
-#                      [1, 1, 1, 1],
-#                      [1, 1, 1, 1]])
-
-# print(l(idx, mask)[1])
-
-# x = torch.tensor([ [[1.0,  0.0,  0.0, 0.0],
-#                     [0.0,  0.0,  0.0, 1.0],
-#                     [0.0,  0.5,  0.5, 0.0]],
-
-#                    [[0.5,  0.2,  0.1, 0.2],
-#                     [0.0,  1.0,  0.0, 0.0],
-#                     [0.0,  0.0,  1.0, 0.0]]])
-# print(x.shape)
-
-# y = l(x)
-# print(y)
-
+    label_logits = jnp.take_along_axis(logits, ignore_labels[..., None], axis=-1)[..., 0]
+    log_normalizers = jnp.log(jnp.sum(jnp.exp(logits), axis=-1))
+    return jnp.sum(jnp.where(no_ignore, log_normalizers - label_logits, jnp.zeros_like(labels)))/total

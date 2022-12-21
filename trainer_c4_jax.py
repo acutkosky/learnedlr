@@ -8,7 +8,7 @@ import argparse
 import time
 from tqdm import tqdm
 # from matplotlib import pyplot as plt
-from model import StackedAttention
+from model_jax import StackedAttention
 import onlineopt
 from omegaconf import OmegaConf
 from omegaconf.errors import ConfigAttributeError
@@ -16,7 +16,12 @@ from optional_module import optional_module
 import c4_loader
 import wandb
 import numpy as np
+import jax
+import optax
 
+from typing import Any
+from jax import numpy as jnp
+from dataclasses import dataclass
 
 import gc
 
@@ -27,90 +32,82 @@ parser.add_argument('--model_config', type=str, default='config/model/base.yaml'
 parser.add_argument('--train_config', type=str, default='config/train/base.yaml')
 
 
+# flax has it's own train_state thing, but I am too lazy to figure out what it does, so I'm just
+# going to implement my own here:
+@dataclass
+class TrainState:
+    model: Any = None
+    optimizer: Any = None
+    params: Any = None
 
-
-# context manager for swapping variables in a model:
-
-
-def get_param_copy(model):
-    return [x.detach().clone() for x in model.parameters()]
-
-def update_param_copy_(model, to_store):
-    for store, p in zip(to_store, model.parameters()):
-        store.copy_(p)
-
-@torch.no_grad()
-def set_params(model, params):
-    for model_p, toset_p in zip(model.parameters(), params):
-        model_p.copy_(toset_p)
-
-class SwapParameters:
-    '''
-    warning: this contex manager will wipe out any gradient info!
-    '''
-    def __init__(self, model, parameters, saved_storage):
+    def __init__(self, rng, model=None, optimizer=None, model_state=None, opt_state=None, dummy_input=None):
+        '''
+        rng: jax psuedo-random number generator
+        dummy_input: flax requires you to trace through the module with some input of the 
+            correct shape before actually initializing anything. It seems dumb to me, but
+            probably not worth reimplementing things for.
+        '''
+        self.rng = rng
         self.model = model
-        self.parameters = parameters
-        self.saved_storage = saved_storage
+        self.optimizer = optimizer
+        self.model_state = model_state
+        self.opt_state = opt_state
+        self.dummy_input = dummy_input
 
-    def __enter__(self):
-        # self.saved_parameters = get_param_copy(self.model)
-        update_param_copy_(self.model, self.saved_storage)
-        set_params(self.model, self.parameters)
+
+        if model_state is None and dummy_input is not None:
+            self.model_state = model.init(rng, dummy_input)
+
+        if self.opt_state is None and self.model_state is not None:
+            self.opt_state = self.optimizer.init(self.model_state)
+        
+
+    def update(self, grads):
+        self.model_state, self.opt_state = self.optimizer.step_fn(grads, self.opt_state, self.model_state)
+
+#@jax.jit
+def optax_init(optimizer, model_state):
+    return optimizer.init(model_state)
+
+
+def optax_state_and_step(optimizer, model_state, *args, **kwargs):
+    optimizer = optimizer(*args,  **kwargs)
+
+
+
+    opt_state = optimizer.init(model_state['params'])
+
+    #@jax.jit
+    def update_step(rng, value, grads, model_state, opt_state, lr):
+        print("tracing update step")
+        constants = model_state['constants']
+        params = model_state['params']
+        updates, opt_state = optimizer.update(grads,  opt_state, model_state['params'])
+        updates = jax.tree_util.tree_map(lambda p: lr * p, updates)
+        params = optax.apply_updates(params, updates)
+        model_state = {'constants': constants, 'params': params}
+        return rng, model_state, opt_state, None
     
-    def __exit__(self, exc_type, exc_value, traceback):
-        set_params(self.model, self.saved_storage)
-            
-
-class SwapManager:
-    '''
-    wrapper around SwapParameters so that if we use it many times
-    with the same model, the temporary storage for the model parameters
-    is always the same memory, saving a lot of allocation/delocations.
-    '''
-    def __init__(self, model):
-        self.model = model
-        self.saved_storage = get_param_copy(model)
-    
-    def swap(self, parameters):
-        return SwapParameters(self.model, parameters, self.saved_storage)
-
-# class TrainConfig:
-#     def __init__(self, **kwargs):
-#         self.batch_size = 64
-#         self.learning_rate = 0.1
-#         self.beta1 = 0.9
-#         self.beta2 = 0.99
-#         self.epochs = 1
-#         self.wd = 0.0
-#         opt = 'adamw'
-
-
-#         for k,v in kwargs.items():
-#             setattr(self, k, v)
-
+    return opt_state, update_step
 
 class Trainer:
-    def __init__(self, model, config, device, tokenizer):
+    def __init__(self, rng, model_state, model_apply, config, tokenizer):
         print(config)
 
+        self.rng = rng
         self.config = config
-        self.device = device
-        self.model = model
+        self.model_state = model_state
+        self.model_apply = model_apply
         self.tokenizer = tokenizer
+
+        self.current_lr = config.lr
 
         self.config.warmup_steps = self.config.warmup_examples // self.config.batch_size
         self.config.total_steps = self.config.epochs *  self.config.valid_frequency_examples // self.config.batch_size
 
         if self.config.optimizer == 'adamw':
-            self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.wd, betas=(config.beta1, config.beta2))
-        elif self.config.optimizer == 'pertensor_randomol':
-            self.optimizer = onlineopt.PerTensorRandomOL(model.parameters(), config=config, named_params=self.model.named_parameters(), logger=wandb)
-        elif self.config.optimizer == 'pertensor_residualol':
-            self.optimizer = onlineopt.PerTensorRandomResidualOL(model.parameters(), config=config, named_params=self.model.named_parameters(), logger=wandb)
-        elif self.config.optimizer == 'global_randomol':
-            self.optimizer = onlineopt.GlobalRandomOL(model.parameters(), config=config, logger=wandb)
- 
+            self.optimizer_state, self.optimizer_step = optax_state_and_step(optax.adamw, model_state, learning_rate=1.0, weight_decay=config.wd)
+            # self.optimizer_step = jax.jit(self.optimizer_step)
         # self.losses = []
 
 
@@ -127,9 +124,6 @@ class Trainer:
         # self.valid_loader = load_valid_data(self.config, self.tokenizer)
         # self.valid_iter = enumerate(self.valid_loader)
 
-        self.total_difference = 0
-
-        self.swap_manager = SwapManager(self.model)
 
     def run_epoch(self, epoch_num):
         iterations_per_epoch = self.config.valid_frequency_examples // self.config.batch_size
@@ -144,11 +138,46 @@ class Trainer:
         
         # abbreviate so we don't need to write self.config and self.model everywhere.
         config = self.config
-        model = self.model
 
-        previous_parameters = get_param_copy(self.model)
 
+        def apply_from_params(params, constants, idx, mask, labels):
+            return self.model_apply({
+                                        'constants': constants,
+                                        'params': params
+                                        },
+                                    idx, mask, labels)[1]
         
+        grad_func = jax.grad(apply_from_params)
+
+        def grad_from_state(model_state, idx, mask, labels):
+            return grad_func(model_state['params'], model_state['constants'], idx, mask, labels)
+        # grad_func = lambda model_state, *args, **kwargs: grad_func(model_state['params'], model_state['constants'], *args, **kwargs)
+
+        # @jax.jit
+
+        model_apply = jax.jit(self.model_apply)
+        def get_loss(model_state, idx, mask, labels):
+            print("tracing get_loss")
+            features, loss, accuracy = self.model_apply(model_state, idx, mask, labels)
+
+            # print(model_state.keys())
+            # print(model_state['params'])
+            grads = grad_from_state(model_state, idx, mask, labels)
+
+            # print("finished")
+            return features, loss, accuracy, grads
+
+
+
+
+        @jax.jit
+        def loss_and_step(rng, model_state, optimizer_state, idx, mask, labels, lr):
+            print("tracing loss and step")
+            # print("jitting...")
+            features, loss, accuracy, grads = get_loss(model_state, idx, mask, labels)
+            rng, model_state, opt_state, log_data = self.optimizer_step(rng, loss, grads, model_state, optimizer_state, lr)
+            return rng, model_state, opt_state, log_data, loss, accuracy
+
 
 
     
@@ -161,73 +190,17 @@ class Trainer:
 
             # self.total_tokens += num_tokens
 
-            idx = strings['input_ids'].to(self.device)
-            mask = strings['attention_mask'].to(self.device)
-            labels = strings['labels'].to(self.device)
+            idx = jnp.array(strings['input_ids'])
+            mask = jnp.array(strings['attention_mask'])
+            labels = jnp.array(strings['labels'])
+
             
 
             log_interval = config.get('log_interval', 100)
             log_dict = {}
 
-            def get_loss(idx, mask, labels):
-                # this function computes gradients
-                model.zero_grad()
-                features, loss, accuracy = self.model(idx, mask, labels)
-                loss.backward()
-                return features, loss, accuracy
-            
+            # loss_and_step = jax
 
-            def inference(idx, mask, labels):
-                # this function is faster than get_loss() but does not allow computing gradients
-                with torch.no_grad():
-                    features, loss, accuracy = self.model(idx, mask, labels)
-                
-
-                return features, loss, accuracy
-
-
-            if config.log_differences or config.correct_inner_products:
-                with self.swap_manager.swap(previous_parameters):
-                    features, prev_loss, accuracy = inference(idx, mask, labels)
-                
-                features, cur_loss, accuracy = inference(idx, mask, labels)
-
-                loss_difference = prev_loss - cur_loss
-                self.total_difference += loss_difference
-
-                log_dict.update({
-                        'optimizer/loss_difference': loss_difference,
-                        'optimizer/total_loss_difference': self.total_difference,
-                    })
-
-            update_param_copy_(model, previous_parameters)
-
-            features, loss, accuracy = get_loss(idx, mask, labels)
-
-            if 'randomol' in config.optimizer and config.correct_inner_products:
-                step_data = loss_difference
-            else:
-                step_data = None
-
-            log_data = self.optimizer.step(step_data)
-
-            if log_data is not None:
-                log_dict.update(log_data)
-
-            self.tokens += (mask >= 0).sum()
-
-
-            current_time = time.monotonic()
-            delta_time = current_time - last_time
-            last_time = current_time
-            running_loss += (loss.item() - running_loss)/min(cur_run_it, 1000.0)
-            epoch_train_loss += (loss.item() - epoch_train_loss)/(cur_run_it)
-            running_accuracy += (accuracy.item() - running_accuracy)/min(cur_run_it, 1000.0)
-            epoch_train_accuracy += (accuracy.item() - epoch_train_accuracy)/(cur_run_it)
-
-            # losses.append(loss.item())
-            self.iterations += 1
-            self.examples += idx.size()[0]
 
 
             if config.optimizer == 'adamw':
@@ -242,19 +215,42 @@ class Trainer:
                     lr = lr * (1.0 - self.iterations/config.total_steps)
                 # linear warmup
                 lr = lr * min(1, float(self.iterations) / float(max(1, config.warmup_steps)))
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = lr
+                self.current_lr = lr
+                # for param_group in self.optimizer.param_groups:
+                #     param_group['lr'] = lr
                 if self.iterations % log_interval == 0:
                     log_dict.update({
                             'optimizer/learned_lr': lr
                         })
 
             
+
+            self.rng, self.model_state, self.optimizer_state, log_data, loss, accuracy  = loss_and_step(self.rng, self.model_state, self.optimizer_state, idx, mask, labels, jnp.array(self.current_lr))
+
+            if log_data is not None:
+                log_dict.update(log_data)
+
+            self.tokens += (mask >= 0).sum()
+
+
+            current_time = time.monotonic()
+            delta_time = current_time - last_time
+            last_time = current_time
+            running_loss += (loss - running_loss)/min(cur_run_it, 1000.0)
+            epoch_train_loss += (loss - epoch_train_loss)/(cur_run_it)
+            running_accuracy += (accuracy - running_accuracy)/min(cur_run_it, 1000.0)
+            epoch_train_accuracy += (accuracy - epoch_train_accuracy)/(cur_run_it)
+
+            # losses.append(loss.item())
+            self.iterations += 1
+            self.examples += idx.shape[0]
+
+
             if self.iterations % log_interval == 0:
                 log_dict.update({
                         "epoch": epoch_num,
-                        "train/loss": loss.item(),
-                        "train/accuracy": accuracy.item(),
+                        "train/loss": loss,
+                        "train/accuracy": accuracy,
                         "it_per_second": 1.0/delta_time,
                         "examples": self.examples,
                         "tokens": self.tokens,
@@ -265,7 +261,7 @@ class Trainer:
                 wandb.log(log_dict, step = self.iterations)
 
 
-            pbar.set_description(f"train epoch {epoch_num+1} iter {t}: current loss {loss.item():.5f}, running loss {running_loss:0.5f}, running accuracy {running_accuracy:0.5f} speed {1.0/delta_time:0.5f}")
+            pbar.set_description(f"train epoch {epoch_num+1} iter {t}: current loss {loss:.5f}, running loss {running_loss:0.5f}, running accuracy {running_accuracy:0.5f} speed {1.0/delta_time:0.5f}")
 
             for _ in range(config.ministeps-1):
                 # take ministeps steps on the current loss...
@@ -421,24 +417,36 @@ def initialize_and_train_model(config):
     #     args=args,
     # )
 
-    device = 'cpu'
-    if torch.cuda.is_available(): 
-        print("setting up model on gpu")           
-        device = torch.cuda.current_device()
-    else:
-        print("there is no gpu!")
+    # device = 'cpu'
+    # if torch.cuda.is_available(): 
+    #     print("setting up model on gpu")           
+    #     device = torch.cuda.current_device()
+    # else:
+    #     print("there is no gpu!")
 
-    print("ready to configure model...")
+    # print("ready to configure model...")
 
-    attention_model = StackedAttention(model_config).to(device)
+    attention_model = StackedAttention(model_config)
+
+
+
+
+    rng = jax.random.PRNGKey(0)
+    rng, init_rng = jax.random.split(rng)
+    rng, train_rng = jax.random.split(rng)
+    rng, valid_rng = jax.random.split(rng)
+
+
+    model_state = attention_model.init(init_rng, jnp.ones([2,10],dtype=int), jnp.full([2,10],False), jnp.ones([2,10], dtype=int))
 
     print("about to train...")
 
     tokenizer = transformers.GPT2TokenizerFast.from_pretrained('gpt2')
     tokenizer.pad_token = tokenizer.eos_token
 
-    trainer = Trainer(attention_model, train_config, device, tokenizer)
-    validator = Validator(attention_model, train_config, device, tokenizer)
+    trainer = Trainer(train_rng, model_state, attention_model.apply, train_config, tokenizer)
+    
+    validator = Validator(attention_model, train_config, valid_rng, tokenizer)
 
     for e in range(train_config.epochs):
         print(f"starting epoch {e+1}")
