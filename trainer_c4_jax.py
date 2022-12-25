@@ -78,15 +78,19 @@ def optax_state_and_step(optimizer, model_state, *args, **kwargs):
     opt_state = optimizer.init(model_state['params'])
 
     #@jax.jit
-    def update_step(rng, value, grads, model_state, opt_state, lr):
+    def update_step(rng, loss_and_grad_fn, model_and_example_state, opt_state, scale):
         print("tracing update step")
+        loss_and_grads = loss_and_grad_fn(model_and_example_state)
+        grads = loss_and_grads['grads']
+
+        model_state = model_and_example_state['model_state']
         constants = model_state['constants']
         params = model_state['params']
         updates, opt_state = optimizer.update(grads,  opt_state, model_state['params'])
-        updates = jax.tree_util.tree_map(lambda p: lr * p, updates)
+        updates = jax.tree_util.tree_map(lambda p: scale * p, updates)
         params = optax.apply_updates(params, updates)
-        model_state = {'constants': constants, 'params': params}
-        return rng, model_state, opt_state, None
+        model_state = {'constants': constants, 'params': param}
+        return rng, loss_and_grads, model_state, opt_state, None
     
     return opt_state, update_step
 
@@ -97,7 +101,7 @@ class Trainer:
         self.rng = rng
         self.config = config
         self.model_state = model_state
-        self.model_apply = model_apply
+        self.model_apply = jax.jit(model_apply)
         self.tokenizer = tokenizer
 
         self.current_lr = config.lr
@@ -151,11 +155,12 @@ class Trainer:
 
         def grad_from_state(model_state, idx, mask, labels):
             return grad_func(model_state['params'], model_state['constants'], idx, mask, labels)
+
+
         # grad_func = lambda model_state, *args, **kwargs: grad_func(model_state['params'], model_state['constants'], *args, **kwargs)
 
         # @jax.jit
 
-        model_apply = jax.jit(self.model_apply)
         def get_loss(model_state, idx, mask, labels):
             print("tracing get_loss")
             features, loss, accuracy = self.model_apply(model_state, idx, mask, labels)
@@ -167,6 +172,19 @@ class Trainer:
             # print("finished")
             return features, loss, accuracy, grads
 
+        def loss_and_grad_fn(model_and_example_state):
+            model_state = model_and_example_state['model_state']
+            idx = model_and_example_state['idx']
+            mask = model_and_example_state['mask']
+            labels = model_and_example_state['labels']
+            features, loss, accuracy, grads = get_loss(model_state, idx, mask, labels)
+            return {
+                'features': features,
+                'loss': loss,
+                'accuracy': accuracy,
+                'grads': grads
+            }
+
 
 
 
@@ -174,9 +192,15 @@ class Trainer:
         def loss_and_step(rng, model_state, optimizer_state, idx, mask, labels, lr):
             print("tracing loss and step")
             # print("jitting...")
-            features, loss, accuracy, grads = get_loss(model_state, idx, mask, labels)
-            rng, model_state, opt_state, log_data = self.optimizer_step(rng, loss, grads, model_state, optimizer_state, lr)
-            return rng, model_state, opt_state, log_data, loss, accuracy
+            # features, loss, accuracy, grads = get_loss(model_state, idx, mask, labels)
+            model_and_example_state = {
+                'model_state': model_state,
+                'idx': idx,
+                'mask': mask,
+                'labels': labels,
+            }
+            rng, loss_and_grads, model_state, opt_state, log_data = self.optimizer_step(rng, loss_and_grad_fn, model_and_example_state, optimizer_state, lr)
+            return rng, loss_and_grads, model_state, opt_state, log_data
 
 
 
@@ -190,9 +214,9 @@ class Trainer:
 
             # self.total_tokens += num_tokens
 
-            idx = jnp.array(strings['input_ids'])
-            mask = jnp.array(strings['attention_mask'])
-            labels = jnp.array(strings['labels'])
+            idx = jax.lax.stop_gradient(jnp.array(strings['input_ids']))
+            mask = jax.lax.stop_gradient(jnp.array(strings['attention_mask']))
+            labels = jax.lax.stop_gradient(jnp.array(strings['labels']))
 
             
 
@@ -225,8 +249,10 @@ class Trainer:
 
             
 
-            self.rng, self.model_state, self.optimizer_state, log_data, loss, accuracy  = loss_and_step(self.rng, self.model_state, self.optimizer_state, idx, mask, labels, jnp.array(self.current_lr))
+            self.rng, loss_and_grads, self.model_state, self.optimizer_state, log_data  = loss_and_step(self.rng, self.model_state, self.optimizer_state, idx, mask, labels, jnp.array(self.current_lr))
 
+            loss = loss_and_grads['loss']
+            accuracy = loss_and_grads['accuracy']
             if log_data is not None:
                 log_dict.update(log_data)
 
@@ -304,11 +330,13 @@ def load_c4_data(config, tokenizer, split):
 
 
 class Validator:
-    def __init__(self, model, config, device, tokenizer):
+    def __init__(self, rng, model_apply, config, tokenizer):
         self.config = config
         self.tokenizer = tokenizer
-        self.model = model
-        self.device = device
+        self.model_apply = model_apply
+        self.rng = rng
+
+        self.model_apply = jax.jit(model_apply)
         
         self.load_data()
         # losses = []
@@ -318,13 +346,11 @@ class Validator:
         self.valid_loader = load_c4_data(self.config, self.tokenizer, split='validation')
         self.valid_iter = enumerate(self.valid_loader)
 
-    @torch.no_grad()
-    def valid(self, epoch, iterations):
+
+    def valid(self,  model_state, epoch, iterations):
 
 
         config = self.config
-        model = self.model
-        device = self.device
 
         iterations_in_valid_phase = config.valid_examples // config.batch_size
         self.running_loss = 0.0
@@ -332,30 +358,33 @@ class Validator:
 
         # train_iter = WikiText2(root='data/', split='train')
         # loader = DataLoader(train_iter, batch_size=config.batch_size, shuffle=True)
+
+        model_state = jax.tree_util.tree_map(lambda x: jax.lax.stop_gradient(x))
+
         def run_valid_iterations(iterations_completed, valid_iterations_left):
             pbar = tqdm(self.valid_iter, total=valid_iterations_left)#, total=len(loader))
             last_time = time.monotonic()
             cur_run_it = 0
             for t, strings in pbar:
                 # encoded = tokenizer(strings, padding=True, truncation=True, return_tensors='pt', max_length=model.config.context_length)
-                idx = strings['input_ids'].to(device)
-                mask = strings['attention_mask'].to(device)
-                labels = strings['labels'].to(device)
+                idx = jax.lax.stop_gradient(jnp.array(strings['input_ids']))
+                mask = jax.lax.stop_gradient(jnp.array(strings['attention_mask']))
+                labels = jax.lax.stop_gradient(jnp.array(strings['labels']))
                 cur_run_it += 1
                 iterations_completed += 1
                 
 
-                features, loss, accuracy = model(idx, mask, labels)
+                features, loss, accuracy = self.model_apply(model_state, idx, mask, labels)
 
 
                 current_time = time.monotonic()
                 delta_time = current_time - last_time
                 last_time = current_time
-                self.running_loss += (loss.item() - self.running_loss)/(iterations_completed)
-                self.running_accuracy += (accuracy.item() - self.running_accuracy)/(iterations_completed)
+                self.running_loss += (loss - self.running_loss)/(iterations_completed)
+                self.running_accuracy += (accuracy - self.running_accuracy)/(iterations_completed)
 
                 # self.losses.append(loss.item())
-                pbar.set_description(f"valid epoch {epoch+1} iter {t}: current loss {loss.item():.5f}, running loss {self.running_loss:0.5f}, running accuracy {self.running_accuracy:0.5f} speed {1.0/delta_time:0.5f}")
+                pbar.set_description(f"valid epoch {epoch+1} iter {t}: current loss {loss:.5f}, running loss {self.running_loss:0.5f}, running accuracy {self.running_accuracy:0.5f} speed {1.0/delta_time:0.5f}")
                 if cur_run_it >= valid_iterations_left:
                     break
             return cur_run_it
@@ -446,12 +475,12 @@ def initialize_and_train_model(config):
 
     trainer = Trainer(train_rng, model_state, attention_model.apply, train_config, tokenizer)
     
-    validator = Validator(attention_model, train_config, valid_rng, tokenizer)
+    validator = Validator(valid_rng, jax.jit(attention_model.apply), train_config, valid_rng, tokenizer)
 
     for e in range(train_config.epochs):
         print(f"starting epoch {e+1}")
         iterations = trainer.run_epoch(e)
-        validator.valid(e, iterations)
+        validator.valid(trainer.model_state, e, iterations)
 
     # losses = train(attention_model, train_config, device)#args, device)
 
