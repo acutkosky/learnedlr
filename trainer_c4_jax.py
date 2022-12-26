@@ -79,18 +79,46 @@ def optax_state_and_step(optimizer, model_state, *args, **kwargs):
 
     #@jax.jit
     def update_step(rng, loss_and_grad_fn, model_and_example_state, opt_state, scale):
+        '''
+        update_step: computes the update.
+        An optimizer should implement a function with this signature:
+        
+            rng: jax rng
+            loss_and_grad_fn: a function that will return a tuple loss, grad.
+                this function shouldtake as input a single jax tree argument.
+            model_and_example_state: input to loss_and_grad_fn (probably a
+                combination of the model state and the example/minibatch)
+            opt_state: state of optimizer
+            scale: scaling value (e.g. a learning rate).
+        
+        returns:
+            rng, value, grad, model_state, opt_state, log_dict
+
+            rng: next value for jax rng
+            value: value returned by loss_and_grad_fn
+            grad: gradient returned by loss_and_grad_fn
+            model_state: next value of the model_state
+            opt_state: next state of optimizer
+            log_dict: dictionary of keys to be logged in wandb (can be set to
+                None to log nothing)
+        '''
         print("tracing update step")
-        loss_and_grads = loss_and_grad_fn(model_and_example_state)
-        grads = loss_and_grads['grads']
+        value, grad = loss_and_grad_fn(model_and_example_state)
+        # grads = loss_and_grads['grads']
 
         model_state = model_and_example_state['model_state']
         constants = model_state['constants']
         params = model_state['params']
-        updates, opt_state = optimizer.update(grads,  opt_state, model_state['params'])
+        updates, opt_state = optimizer.update(grad,  opt_state, model_state['params'])
+
+        # The learning rate scheduler thing in optax seems more complicated than
+        # just doing this:
         updates = jax.tree_util.tree_map(lambda p: scale * p, updates)
+
+
         params = optax.apply_updates(params, updates)
         model_state = {'constants': constants, 'params': params}
-        return rng, loss_and_grads, model_state, opt_state, None
+        return rng, value, grad, model_state, opt_state, None
     
     return opt_state, update_step
 
@@ -127,21 +155,6 @@ class Trainer:
         # load valid data
         # self.valid_loader = load_valid_data(self.config, self.tokenizer)
         # self.valid_iter = enumerate(self.valid_loader)
-
-
-    def run_epoch(self, epoch_num):
-        iterations_per_epoch = self.config.valid_frequency_examples // self.config.batch_size
- 
-        pbar = tqdm(self.train_iter, total=iterations_per_epoch)#, total=len(loader))
-        running_loss = 0.0
-        running_accuracy = 0.0
-        epoch_train_loss = 0.0
-        epoch_train_accuracy = 0.0
-        last_time = time.monotonic()
-        cur_run_it = 0
-        
-        # abbreviate so we don't need to write self.config and self.model everywhere.
-        config = self.config
 
 
         def apply_from_params(params, constants, idx, mask, labels):
@@ -181,9 +194,8 @@ class Trainer:
             return {
                 'features': features,
                 'loss': loss,
-                'accuracy': accuracy,
-                'grads': grads
-            }
+                'accuracy': accuracy
+                }, grads
 
 
 
@@ -199,8 +211,25 @@ class Trainer:
                 'mask': mask,
                 'labels': labels,
             }
-            rng, loss_and_grads, model_state, opt_state, log_data = self.optimizer_step(rng, loss_and_grad_fn, model_and_example_state, optimizer_state, lr)
-            return rng, loss_and_grads, model_state, opt_state, log_data
+            rng, loss, grad, model_state, opt_state, log_data = self.optimizer_step(rng, loss_and_grad_fn, model_and_example_state, optimizer_state, lr)
+            return rng, loss, model_state, opt_state, log_data
+
+        self.loss_and_step = loss_and_step
+
+
+    def run_epoch(self, epoch_num):
+        iterations_per_epoch = self.config.valid_frequency_examples // self.config.batch_size
+ 
+        pbar = tqdm(self.train_iter, total=iterations_per_epoch)#, total=len(loader))
+        running_loss = 0.0
+        running_accuracy = 0.0
+        epoch_train_loss = 0.0
+        epoch_train_accuracy = 0.0
+        last_time = time.monotonic()
+        cur_run_it = 0
+        
+        # abbreviate so we don't need to write self.config and self.model everywhere.
+        config = self.config
 
 
 
@@ -249,10 +278,10 @@ class Trainer:
 
             
 
-            self.rng, loss_and_grads, self.model_state, self.optimizer_state, log_data  = loss_and_step(self.rng, self.model_state, self.optimizer_state, idx, mask, labels, jnp.array(self.current_lr))
+            self.rng, loss_and_accuracy, self.model_state, self.optimizer_state, log_data  = self.loss_and_step(self.rng, self.model_state, self.optimizer_state, idx, mask, labels, jnp.array(self.current_lr))
 
-            loss = loss_and_grads['loss']
-            accuracy = loss_and_grads['accuracy']
+            loss = loss_and_accuracy['loss']
+            accuracy = loss_and_accuracy['accuracy']
             if log_data is not None:
                 log_dict.update(log_data)
 
