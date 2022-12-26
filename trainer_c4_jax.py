@@ -89,7 +89,7 @@ def optax_state_and_step(optimizer, model_state, *args, **kwargs):
         updates, opt_state = optimizer.update(grads,  opt_state, model_state['params'])
         updates = jax.tree_util.tree_map(lambda p: scale * p, updates)
         params = optax.apply_updates(params, updates)
-        model_state = {'constants': constants, 'params': param}
+        model_state = {'constants': constants, 'params': params}
         return rng, loss_and_grads, model_state, opt_state, None
     
     return opt_state, update_step
@@ -359,7 +359,7 @@ class Validator:
         # train_iter = WikiText2(root='data/', split='train')
         # loader = DataLoader(train_iter, batch_size=config.batch_size, shuffle=True)
 
-        model_state = jax.tree_util.tree_map(lambda x: jax.lax.stop_gradient(x))
+        model_state = jax.tree_util.tree_map(lambda x: jax.lax.stop_gradient(x), model_state)
 
         def run_valid_iterations(iterations_completed, valid_iterations_left):
             pbar = tqdm(self.valid_iter, total=valid_iterations_left)#, total=len(loader))
@@ -475,7 +475,7 @@ def initialize_and_train_model(config):
 
     trainer = Trainer(train_rng, model_state, attention_model.apply, train_config, tokenizer)
     
-    validator = Validator(valid_rng, jax.jit(attention_model.apply), train_config, valid_rng, tokenizer)
+    validator = Validator(valid_rng, jax.jit(attention_model.apply), train_config, tokenizer)
 
     for e in range(train_config.epochs):
         print(f"starting epoch {e+1}")
