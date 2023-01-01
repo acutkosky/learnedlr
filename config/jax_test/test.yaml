@@ -1,0 +1,60 @@
+model:
+  embedding_dim: 768
+  n_layers: 12
+  n_heads: 12
+  context_length: 20
+  use_diag: False
+  use_fc: True
+train:
+  framework: 'pytorch'
+  optimizer: custom # current options: adamw, pertensor_randomol
+
+
+  custom_opt:
+
+    name: 'adamw_learned_lr'
+    ogd:
+      lr: 0.01
+    
+    cb:
+      eps: 1e-4
+      eta: 2.219 (2/(2 - log(3)))
+      decay: 0.99
+
+
+    adamw_learned_lr:
+      beta1: 0.9
+      beta2: 0.99
+      wd: 0.0001
+      cb:
+        eps: 1e-4
+        eta: 2.219
+        decay: 0.99
+
+  wd: 0.0001
+
+  # generic options useful for all training algorithms
+  warmup_examples: 0 #1024000 # how many examples of linear warmup to perform
+  total_examples: 12288000
+  lr: 0.0001 # learning rate
+  beta1: 0.9 #beta values for adam algorithms
+  beta2: 0.99
+
+  linear_decay: False
+  cosine_decay: False
+  true_cosine_decay: False
+
+  decay_type: true_cosine
+
+  # generic options for the trainer
+  num_workers: 3
+  batch_size: 1024
+  valid_frequency_examples: 40960 # how many training examples to process between computing validation performance (training set is too big to actually pass all the way through even once)
+  valid_examples: 5120 # how many examples to use for validation (validation set is pretty big, so we just subsample by looping through it when computing validation stats)
+
+
+  # options for wandb
+  log_differences: false
+  logging: true
+  wandb_project: C4_adamw_jax_12M
+  log_interval: 10

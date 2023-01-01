@@ -19,6 +19,10 @@ import numpy as np
 import jax
 import optax
 
+from functools import partial
+
+import opt_jax
+
 from typing import Any
 from jax import numpy as jnp
 from dataclasses import dataclass
@@ -30,40 +34,6 @@ parser = argparse.ArgumentParser(description='Simple pretraining thing')
 parser.add_argument('--config', type=str, default='config/default.yaml')
 parser.add_argument('--model_config', type=str, default='config/model/base.yaml')
 parser.add_argument('--train_config', type=str, default='config/train/base.yaml')
-
-
-# flax has it's own train_state thing, but I am too lazy to figure out what it does, so I'm just
-# going to implement my own here:
-@dataclass
-class TrainState:
-    model: Any = None
-    optimizer: Any = None
-    params: Any = None
-
-    def __init__(self, rng, model=None, optimizer=None, model_state=None, opt_state=None, dummy_input=None):
-        '''
-        rng: jax psuedo-random number generator
-        dummy_input: flax requires you to trace through the module with some input of the 
-            correct shape before actually initializing anything. It seems dumb to me, but
-            probably not worth reimplementing things for.
-        '''
-        self.rng = rng
-        self.model = model
-        self.optimizer = optimizer
-        self.model_state = model_state
-        self.opt_state = opt_state
-        self.dummy_input = dummy_input
-
-
-        if model_state is None and dummy_input is not None:
-            self.model_state = model.init(rng, dummy_input)
-
-        if self.opt_state is None and self.model_state is not None:
-            self.opt_state = self.optimizer.init(self.model_state)
-        
-
-    def update(self, grads):
-        self.model_state, self.opt_state = self.optimizer.step_fn(grads, self.opt_state, self.model_state)
 
 #@jax.jit
 def optax_init(optimizer, model_state):
@@ -78,7 +48,7 @@ def optax_state_and_step(optimizer, model_state, *args, **kwargs):
     opt_state = optimizer.init(model_state['params'])
 
     #@jax.jit
-    def update_step(rng, loss_and_grad_fn, model_and_example_state, opt_state, scale):
+    def update_step(loss_and_grad_fn, rng, model_and_example_state, opt_state, scale, do_logging=False):
         '''
         update_step: computes the update.
         An optimizer should implement a function with this signature:
@@ -90,6 +60,8 @@ def optax_state_and_step(optimizer, model_state, *args, **kwargs):
                 combination of the model state and the example/minibatch)
             opt_state: state of optimizer
             scale: scaling value (e.g. a learning rate).
+            do_logging: boolean indicating whether to return a dict of values to 
+                log (ignored here).
         
         returns:
             rng, value, grad, model_state, opt_state, log_dict
@@ -138,8 +110,46 @@ class Trainer:
         self.config.total_steps = self.config.epochs *  self.config.valid_frequency_examples // self.config.batch_size
 
         if self.config.optimizer == 'adamw':
+            # self.optimizer_state = opt_jax.adamw_init(model_state['params'], lr=1.0, beta1=config.beta1, beta2=config.beta2, wd=config.wd)
+            # self.optimizer_step = opt_jax.adamw
             self.optimizer_state, self.optimizer_step = optax_state_and_step(optax.adamw, model_state, learning_rate=1.0, weight_decay=config.wd)
             # self.optimizer_step = jax.jit(self.optimizer_step)
+        if self.config.optimizer == 'custom':
+            if self.config.custom_opt.name == 'adamw':
+                self.optimizer_state = opt_jax.adamw_init(model_state['params'], lr=1.0, beta1=config.beta1, beta2=config.beta2, wd=config.wd)
+                self.optimizer_step = opt_jax.adamw
+
+            if self.config.custom_opt.name == 'ol_expmd':
+                self.optimizer_state = opt_jax.OL_momentum_expmd_init(model_state['params'], grid_size=2)
+                self.optimizer_step = opt_jax.OL_momentum_expmd_update
+
+            if self.config.custom_opt.name == 'ol_ogd':
+                self.optimizer_state = opt_jax.OL_momentum_ogd_init(model_state['params'], ol_lr=config.custom_opt.ogd.lr)
+                self.optimizer_step = opt_jax.OL_momentum_ogd_update
+
+            if self.config.custom_opt.name == 'ol_cb':
+                self.optimizer_state = opt_jax.OL_momentum_init(
+                    model_state['params'],
+                    ol_init=opt_jax.cb_init,
+                    eps=config.custom_opt.cb.eps,
+                    eta=config.custom_opt.cb.eta,
+                    decay=config.custom_opt.cb.decay
+                )
+                self.optimizer_step = partial(opt_jax.OL_momentum_update, opt_jax.cb_update)
+
+            if self.config.custom_opt.name == 'adamw_learned_lr':
+                opt_conf = config.custom_opt.adamw_learned_lr
+                self.optimizer_state = opt_jax.adamw_learned_lr_init(
+                    model_state['params'],
+                    ol_init=lambda x: opt_jax.cb_init(x, opt_conf.cb.eps, opt_conf.cb.eta, opt_conf.cb.decay),
+                    lr=1.0,
+                    beta1=opt_conf.beta1,
+                    beta2=opt_conf.beta2,
+                    wd=opt_conf.wd,
+                )
+                
+                self.optimizer_step = partial(opt_jax.adamw_learned_lr_update, opt_jax.cb_update)
+
         # self.losses = []
 
 
@@ -200,8 +210,7 @@ class Trainer:
 
 
 
-        @jax.jit
-        def loss_and_step(rng, model_state, optimizer_state, idx, mask, labels, lr):
+        def loss_and_step(rng, model_state, optimizer_state, idx, mask, labels, lr, do_logging=False):
             print("tracing loss and step")
             # print("jitting...")
             # features, loss, accuracy, grads = get_loss(model_state, idx, mask, labels)
@@ -211,10 +220,12 @@ class Trainer:
                 'mask': mask,
                 'labels': labels,
             }
-            rng, loss, grad, model_state, opt_state, log_data = self.optimizer_step(rng, loss_and_grad_fn, model_and_example_state, optimizer_state, lr)
+            rng, loss, grad, model_state, opt_state, log_data = self.optimizer_step(loss_and_grad_fn, rng, model_and_example_state, optimizer_state, lr, do_logging)
             return rng, loss, model_state, opt_state, log_data
 
-        self.loss_and_step = loss_and_step
+        self.loss_and_step = jax.jit(loss_and_step, static_argnames='do_logging')
+
+        # self.loss_and_step = loss_and_step
 
 
     def run_epoch(self, epoch_num):
@@ -252,6 +263,8 @@ class Trainer:
             log_interval = config.get('log_interval', 100)
             log_dict = {}
 
+            log_iteration = (self.iterations % log_interval == 0) and config.logging
+
             # loss_and_step = jax
 
 
@@ -271,20 +284,29 @@ class Trainer:
                 self.current_lr = lr
                 # for param_group in self.optimizer.param_groups:
                 #     param_group['lr'] = lr
-                if self.iterations % log_interval == 0:
+                if log_iteration:
                     log_dict.update({
-                            'optimizer/learned_lr': lr
+                            'optimizer/lr_schedule': lr
                         })
 
-            
 
-            self.rng, loss_and_accuracy, self.model_state, self.optimizer_state, log_data  = self.loss_and_step(self.rng, self.model_state, self.optimizer_state, idx, mask, labels, jnp.array(self.current_lr))
+
+            self.rng, loss_and_accuracy, self.model_state, self.optimizer_state, log_data  = self.loss_and_step(
+                self.rng,
+                self.model_state,
+                self.optimizer_state,
+                idx,
+                mask,
+                labels,
+                jnp.array(self.current_lr),
+                log_iteration)
 
             loss = loss_and_accuracy['loss']
             accuracy = loss_and_accuracy['accuracy']
-            if log_data is not None:
-                log_dict.update(log_data)
-
+            if log_data is not None and log_iteration:
+                for key, value in log_data.items():
+                    log_dict["optimizer/" + key] = value
+    
             self.tokens += (mask >= 0).sum()
 
 
@@ -301,7 +323,7 @@ class Trainer:
             self.examples += idx.shape[0]
 
 
-            if self.iterations % log_interval == 0:
+            if log_iteration:
                 log_dict.update({
                         "epoch": epoch_num,
                         "train/loss": loss,
