@@ -17,8 +17,8 @@ train:
       lr: 0.01
     
     cb:
-      eps: 1e-4
-      eta: 2.219 (2/(2 - log(3)))
+      eps: 1e-8
+      eta: 2.219 #(2/(2 - log(3)))
       decay: 0.99
 
 
@@ -26,8 +26,10 @@ train:
       beta1: 0.9
       beta2: 0.99
       wd: 0.0001
+      lower_bound: 1e-3
+      upper_bound: 100.0
       cb:
-        eps: 1e-4
+        eps: 1e-5
         eta: 2.219
         decay: 0.99
 
@@ -49,8 +51,8 @@ train:
   # generic options for the trainer
   num_workers: 3
   batch_size: 1024
-  valid_frequency_examples: 40960 # how many training examples to process between computing validation performance (training set is too big to actually pass all the way through even once)
-  valid_examples: 5120 # how many examples to use for validation (validation set is pretty big, so we just subsample by looping through it when computing validation stats)
+  valid_frequency_examples: 409600 # how many training examples to process between computing validation performance (training set is too big to actually pass all the way through even once)
+  valid_examples: 51200 # how many examples to use for validation (validation set is pretty big, so we just subsample by looping through it when computing validation stats)
 
 
   # options for wandb

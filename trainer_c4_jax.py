@@ -146,6 +146,8 @@ class Trainer:
                     beta1=opt_conf.beta1,
                     beta2=opt_conf.beta2,
                     wd=opt_conf.wd,
+                    lower_bound=opt_conf.lower_bound,
+                    upper_bound=opt_conf.upper_bound,
                 )
                 
                 self.optimizer_step = partial(opt_jax.adamw_learned_lr_update, opt_jax.cb_update)
@@ -269,25 +271,25 @@ class Trainer:
 
 
 
-            if config.optimizer == 'adamw':
+            # if self.do_warmup:
 
-                # cosine decay
-                lr = config.lr
-                if config.decay_type == 'half_cosine':
-                    lr = lr * np.cos(0.5 * np.pi * self.iterations/config.total_steps)
-                if config.decay_type == 'true_cosine':
-                    lr = lr *  0.5 * (1+ np.cos(np.pi * self.iterations/config.total_steps))
-                if config.decay_type == 'linear':
-                    lr = lr * (1.0 - self.iterations/config.total_steps)
-                # linear warmup
-                lr = lr * min(1, float(self.iterations) / float(max(1, config.warmup_steps)))
-                self.current_lr = lr
-                # for param_group in self.optimizer.param_groups:
-                #     param_group['lr'] = lr
-                if log_iteration:
-                    log_dict.update({
-                            'optimizer/lr_schedule': lr
-                        })
+            # cosine decay
+            lr = config.lr
+            if config.decay_type == 'half_cosine':
+                lr = lr * np.cos(0.5 * np.pi * self.iterations/config.total_steps)
+            if config.decay_type == 'true_cosine':
+                lr = lr *  0.5 * (1+ np.cos(np.pi * self.iterations/config.total_steps))
+            if config.decay_type == 'linear':
+                lr = lr * (1.0 - self.iterations/config.total_steps)
+            # linear warmup
+            lr = lr * min(1, float(self.iterations) / float(max(1, config.warmup_steps)))
+            self.current_lr = lr
+            # for param_group in self.optimizer.param_groups:
+            #     param_group['lr'] = lr
+            if log_iteration:
+                log_dict.update({
+                        'optimizer/lr_schedule': lr
+                    })
 
 
 

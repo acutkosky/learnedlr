@@ -212,13 +212,18 @@ def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_
     scale_grad = tree_dot(prev_update, grad)
 
 
+    cur_rng, rng  = jax.random.split(rng)
+
+    rand_scaling = jax.random.uniform(cur_rng)
+
+
     # apply constraint set reduction for 1-D intervals
     scale_grad = jnp.where(
-        (ol_prediction - prev_lr_offset) * jnp.sign(scale_grad) >= 0,
+        -(ol_prediction - prev_lr_offset) * jnp.sign(scale_grad) > 1e-8, # should be == 0 when no clipping happens, but idk about floating point stuff.
         jnp.zeros_like(scale_grad),
         scale_grad)
 
-    ol_state = ol_update(scale_grad, ol_state)
+    ol_state, ol_logs = ol_update(scale_grad, ol_state)
 
 
 
@@ -242,7 +247,7 @@ def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_
     )
 
     param_next = tree_map(
-        lambda p, u: p + (scale + offset) * u,
+        lambda p, u: p + (scale + rand_scaling * offset) * u,
         params,
         update)
 
@@ -272,14 +277,197 @@ def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_
 
     if do_logging:
         log_dict = {
-            'learned_lr': scale + offset
+            'learned_lr': scale + offset,
         }
+        log_dict.update(ol_logs)
     else:
         log_dict = None
 
     return rng, value, grad, model_state_next, opt_state_next, log_dict
 
 
+
+
+
+
+
+
+
+
+def adamw_learned_per_layer__lr_init(params, ol_init, lr=1e-3, beta1=0.9, beta2=0.99, wd=0.0, epsilon=1e-8, lower_bound=1e-8, upper_bound=10, *args, **kwargs):
+    state = {
+        'lr': jnp.array(lr),
+        'beta1': jnp.array(beta1),
+        'beta2': jnp.array(beta2),
+        'wd': jnp.array(wd),
+        'epsilon': jnp.array(epsilon),
+        'count': jnp.array(0),
+        'm': tree_map(lambda x: jnp.zeros_like(x), params),
+        'v': tree_map(lambda x: jnp.zeros_like(x), params),
+        'prev_update': tree_map(lambda x: jnp.zeros_like(x), params),
+        'prev_lr_offset': jnp.zeros(1),
+        'lower_bound': lower_bound,
+        'upper_bound': upper_bound,
+        'ol_state': ol_init(tree_map(lambda x: jnp.zeros(1), params), *args, **kwargs),
+    }
+    return state
+
+
+
+
+def adamw_learned_per_layer_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_state, opt_state, scale=jnp.array(1.0), do_logging=False):
+    '''
+        computes and optimizer update step.
+            ol_update: this is the online learner updater.
+                currently should just be cb_update.
+            rng: jax rng
+            loss_and_grad_fn: a function that will return a tuple loss, grad.
+                this function should take as input a single jax tree argument.
+            model_and_example_state: input to loss_and_grad_fn (probably a
+                combination of the model state and the example/minibatch)
+                This should be a dict for which one key is 'model_state'.
+
+                model_and_example_state['model_state'] should be a flax
+                model_state object, so it should have two keys, 'params' and 'constants'.
+                'params' should contain model params and 'constants' should
+                contains constants (probably this could be generalized a bit in future).
+
+                The grad value returned by loss_and_grad_fn should have the 
+                same pytree shape as params.
+
+            opt_state: state of optimizer
+            scale: scaling value (e.g. a learning rate).
+
+            do_logging: boolean for whether to output logging info.
+                WARNING: if you jit this function, you may want to set
+                do_logging as a static argument because it is used in a plain old
+                python "if" statement (although it may be ok if you only ever use
+                do_logging=True or do_logging=False and never switch).
+        
+        returns:
+            rng, value, grad, model_state, opt_state, log_dict
+
+            rng: next value for jax rng
+            value: value returned by loss_and_grad_fn
+            grad: gradient returned by loss_and_grad_fn
+            model_state: next value of the model_state
+            opt_state: next state of optimizer
+            log_dict: dictionary of keys to be logged in wandb (will be None if do_logging is False)
+    '''
+
+    value, grad = loss_and_grad_fn(model_and_example_state)
+
+    model_state = model_and_example_state['model_state']
+
+    params = model_state['params']
+    constants = model_state['constants']
+    # other_values = {key: value for key, value in model_state.iter_items() if key != params}
+
+    m = opt_state['m']
+    v = opt_state['v']
+    lr = opt_state['lr']
+    beta1 = opt_state['beta1']
+    beta2 = opt_state['beta2']
+    wd = opt_state['wd']
+    epsilon = opt_state['epsilon']
+    count = opt_state['count']
+    prev_update = opt_state['prev_update']
+    prev_lr_offset = opt_state['prev_lr_offset']
+    ol_state = opt_state['ol_state']
+    lower_bound = opt_state['lower_bound']
+    upper_bound = opt_state['upper_bound']
+
+
+    ol_prediction = ol_state['prediction']
+
+
+    scale_grad = tree_map(
+        lambda u, g: jnp.sum(u*g),
+        prev_update, grad
+        )
+        
+
+
+    cur_rng, rng  = jax.random.split(rng)
+
+    rand_scaling = jax.random.uniform(cur_rng)
+
+
+    # apply constraint set reduction for 1-D intervals
+    scale_grad = tree_map(
+        lambda ol, prev, sg: jnp.where(
+            -(ol - prev) * jnp.sign(sg) > 1e-8, # should be == 0 when no clipping happens, but idk about floating point stuff.
+            jnp.zeros_like(sg),
+            sg),
+        ol_prediction,
+        prev_lr_offset,
+        scale_grad)
+        
+
+    ol_state, ol_logs = ol_update(scale_grad, ol_state)
+
+
+
+    offset = tree_map(
+        lambda pred: jnp.clip(pred, a_min=lower_bound*scale-scale, a_max=upper_bound*scale-scale),
+        ol_state['prediction'])
+    
+
+    m_next = tree_map(lambda old_m, g: old_m * beta1 + g * (1.0 - beta2), m, grad)
+
+    v_next = tree_map(lambda old_v, g: old_v * beta2 + (g**2) * (1.0 - beta2), v, grad)
+    
+    count_next = count + 1
+
+    m_hat = tree_map(lambda m: m / (1.0 - beta1**count_next), m_next)
+    v_hat = tree_map(lambda v: v / (1.0 - beta2**count_next), v_next)
+
+    update = tree_map(
+        lambda m, v, p: -lr * m/(epsilon+jnp.sqrt(v)) - wd * p,
+        m_hat,
+        v_hat,
+        params,
+    )
+
+    param_next = tree_map(
+        lambda p, u, o: p + (scale + rand_scaling * o) * u,
+        params,
+        update,
+        offset)
+
+
+
+    opt_state_next = {
+        'lr': lr,
+        'beta1': beta1,
+        'beta2': beta2,
+        'wd': wd,
+        'epsilon': epsilon,
+        'count': count_next,
+        'm': m_next,
+        'v': v_next,
+        'prev_update': update,
+        'prev_lr_offset': offset,
+        'lower_bound': lower_bound,
+        'upper_bound': upper_bound,
+        'ol_state': ol_state,
+    }
+
+    model_state_next = {
+        'constants': constants,
+        'params': param_next
+    }
+
+
+    if do_logging:
+        log_dict = {
+            'learned_lr': scale + offset,
+        }
+        log_dict.update(ol_logs)
+    else:
+        log_dict = None
+
+    return rng, value, grad, model_state_next, opt_state_next, log_dict
 
 
 
@@ -425,11 +613,12 @@ def ogd_update(grad, opt_state, max_bound=None, min_bound=None):
 
 def cb_init(params, eps=1.0, eta=2.0/(2-np.log(3)), decay=1.0):
     state = {}
-    state['reward'] = tree_map(lambda x: jnp.zeros_like(x), params)
+    state['wealth'] = tree_map(lambda x: jnp.full_like(x, fill_value=eps), params)
     state['bet_fractions'] = tree_map(lambda x: jnp.zeros_like(x), params)
     state['bet_grad_squared_sum'] = tree_map(lambda x: jnp.full_like(x, fill_value=1e-8), params)
     state['max_grads'] = tree_map(lambda x: jnp.full_like(x, fill_value=1e-8), params)
     state['prediction'] = tree_map(lambda x: jnp.zeros_like(x), params)
+    state['grad_sum'] = tree_map(lambda x: jnp.zeros_like(x), params)
     state['eta'] = eta
     state['eps'] = eps
     state['decay'] = decay
@@ -439,28 +628,33 @@ def cb_init(params, eps=1.0, eta=2.0/(2-np.log(3)), decay=1.0):
 
 
 def cb_reset(state):
-    state['reward'] = tree_map(lambda x: jnp.zeros_like(x), state['rewards'])
+    state['wealth'] = tree_map(lambda x: jnp.full_like(x, fill_value=state['eps']), state['wealth'])
     state['bet_fractions'] = tree_map(lambda x: jnp.zeros_like(x), state['bet_fractions'])
     state['bet_grad_squared_sum'] = tree_map(lambda x: jnp.full_like(x, fill_value=1e-8), state['bet_grad_squared_sum'])
     state['max_grads'] = tree_map(lambda x: jnp.full_like(x, fill_value=1e-8), state['max_grads'])
     state['prediction'] = tree_map(lambda x: jnp.zeros_like(x), state['prediction'])
     return state    
 
-def cb_update(grad, opt_state):
+def cb_update(grad, opt_state, do_logging=False):
     
-    reward = opt_state['reward']
+    wealth = opt_state['wealth']
     bet_fractions = opt_state['bet_fractions']
     bet_grad_squared_sum = opt_state['bet_grad_squared_sum']
     max_grads = opt_state['max_grads']
     eta = opt_state['eta']
     eps = opt_state['eps']
     decay = opt_state['decay']
+    grad_sum = opt_state['grad_sum']
+
 
 
 
     max_grads_next = tree_map(lambda m, g: jnp.maximum(m * decay, jnp.abs(g)), max_grads, grad)
 
     grad = tree_map(lambda g, m: jnp.clip(g, a_min=-m, a_max=m), grad, max_grads)
+
+
+    grad_sum_next = tree_map(lambda s, g: s * decay + g, grad_sum, grad)
 
     bet_grad = tree_map(
         lambda g, b: g/(1 - decay * g* b),
@@ -469,7 +663,7 @@ def cb_update(grad, opt_state):
     )
 
     bet_grad_squared_sum_next = tree_map(lambda x, z: x*decay**2 + z**2, bet_grad_squared_sum,  bet_grad)
-    reward_next = tree_map(lambda r, g, b: r * (decay - b * g), reward, bet_fractions, grad)
+    wealth_next = tree_map(lambda r, g, b: r * (decay - b * g), wealth, bet_fractions, grad)
     
     
     bet_fractions_next = tree_map(
@@ -481,20 +675,27 @@ def cb_update(grad, opt_state):
         bet_grad_squared_sum_next,
         max_grads_next)
 
-    param_next = tree_map(lambda r, b: (eps + r)*b, reward_next, bet_fractions_next)
+    param_next = tree_map(lambda r, b: r * b, wealth_next, bet_fractions_next)
 
     opt_state_next = {
-        'reward': reward_next,
+        'wealth': wealth_next,
         'bet_fractions': bet_fractions_next,
         'bet_grad_squared_sum': bet_grad_squared_sum_next,
         'max_grads': max_grads_next,
         'eta': eta,
         'eps': eps,
         'decay': decay,
-        'prediction': param_next
+        'prediction': param_next,
+        'grad_sum': grad_sum_next,
     }
 
-    return opt_state_next
+    return opt_state_next, {
+        'grad_sum': tree_map(lambda x: jnp.average(x), grad_sum_next),
+        'wealth': tree_map(lambda x: jnp.average(x), wealth_next),
+        'bet_fractions': tree_map(lambda x: jnp.average(x), bet_fractions_next),
+        'max_grad': tree_map(lambda x: jnp.average(x), max_grads_next),
+        'unconstrained_lr': tree_map(lambda x: jnp.average(x), param_next),
+        }
 
 
 
@@ -561,7 +762,7 @@ def OL_momentum_update(ol_update, loss_and_grad_fn, rng, model_and_example_state
         ol_prediction,
         grad)
 
-    ol_state_next = ol_update(grad, ol_state)
+    ol_state_next, ol_logs = ol_update(grad, ol_state, do_logging)
 
     offset = tree_map(
         lambda p: jnp.clip(p, a_min=-scale, a_max=scale),
@@ -592,6 +793,7 @@ def OL_momentum_update(ol_update, loss_and_grad_fn, rng, model_and_example_state
         log_dict = {
             'total_reward': total_reward_next
         }
+        log_dict.update(ol_logs)
     else:
         log_dict = None
 
