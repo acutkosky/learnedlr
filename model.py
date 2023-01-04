@@ -84,8 +84,8 @@ class ResidualSelfAttention(torch.nn.Module):
         # self.residual_weight = torch.nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x):
-        if self.config.use_diag == 'true':
-            y = self.diagnorm(x)
+        # if self.config.use_diag == 'true':
+        #     y = self.diagnorm(x)
         y = self.ln(x)
         y = self.selfattention(y)
         

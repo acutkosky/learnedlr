@@ -18,6 +18,7 @@ from flax.linen.module import Module, compact, merge_param
 from typing import Callable, Any, Optional
 from einops import rearrange
 
+t_Dense = lambda *args, **kwargs: nn.Dense(*args, kernel_init=jax.nn.initializers.he_uniform(), bias_init=jax.nn.initializers.he_uniform(in_axis=-1), **kwargs)
 
 def Identity():
     # Is this function stupid? yes it is, but we keep it here so that 
@@ -55,9 +56,9 @@ class SelfAttention(nn.Module):
         config = self.config
         dim = config.embedding_dim
 
-        key_matrix = nn.Dense(config.embedding_dim) # maybe we want to mess with initialization schemes later?
+        key_matrix = t_Dense(config.embedding_dim) # maybe we want to mess with initialization schemes later?
         query_matrix = Identity()#torch.nn.Linear(self.dim, self.dim)
-        value_matrix = nn.Dense(config.embedding_dim)
+        value_matrix = t_Dense(config.embedding_dim)
         
         n_heads = config.n_heads
         context_length = config.context_length
@@ -85,7 +86,12 @@ class SelfAttention(nn.Module):
         # print(query.shape)
 
         logits = jnp.matmul(key, rearrange(query, '... nh T hs -> ... nh hs T')) # [..., nh, T, hs] x [..., nh, hs, T] -> [..., nh, T, T]
-        masked_logits = jnp.where(mask.value[:, :, :T, :T] == 0, -jnp.inf, logits)
+        print(f"mask shape: {(mask.value[:, :, :T, :T] == 0).shape}")
+        print(f"logits shape: {logits.shape}")
+        broadcast_mask = jnp.broadcast_to((mask.value[:, :, :T, :T] == 0), logits.shape)
+        print(f"broadcast shape: {broadcast_mask.shape}")
+
+        masked_logits = jnp.where(broadcast_mask, -jnp.inf, logits)
         
         # masked_fill(logits, mask.value[:,:,:T,:T] == 0, float('-inf'))
 
@@ -115,8 +121,8 @@ class ResidualSelfAttention(nn.Module):
 
         ln = nn.LayerNorm(config.embedding_dim)
 
-        fc1 = nn.Dense(2 * config.embedding_dim)
-        fc2 = nn.Dense(config.embedding_dim)
+        fc1 = t_Dense(2 * config.embedding_dim)
+        fc2 = t_Dense(config.embedding_dim)
 
 
         y = ln(x)
@@ -138,7 +144,10 @@ class StackedAttention(nn.Module):
         config = self.config
 
         self.features = nn.Sequential([ResidualSelfAttention(config) for _ in range(config.n_layers)])
-        self.tok_embeddings = nn.Embed(config.vocab_size, config.embedding_dim)
+        self.tok_embeddings = nn.Embed(
+            config.vocab_size,
+            config.embedding_dim,
+            embedding_init=nn.initializers.variance_scaling(config.vocab_size, 'fan_in', 'normal', out_axis=0))
         self.pos_embeddings = self.param('position_embedding',
                                          lambda rng : jnp.zeros((1, config.context_length, config.embedding_dim)))
 
@@ -209,23 +218,6 @@ class StackedAttention(nn.Module):
         return features, loss, accuracy        
                     
 
-# from omegaconf import OmegaConf
-# config = OmegaConf.load('config/meta_opt/offset_sgd.yaml').model
-# config.vocab_size = 1000
-
-# model = StackedAttention(config)
-
-# model_state= model.init(jax.random.PRNGKey(0), jnp.ones([2,10],dtype=int), jnp.full([2,10],False), jnp.ones([2,10], dtype=int))
-
-# features, loss, accuracy = model.apply(model_state, jnp.zeros([1,50],dtype=int), jnp.full([1,50],False), jnp.ones([1,50], dtype=int))
-
-# # grad_fn = jax.grad(lambda *args: model.apply(*args)[1])
-
-# # grad = grad_fn(model_state, jnp.zeros([1,50],dtype=int), jnp.full([1,50],False), jnp.ones([1,50], dtype=int))
-
-# print(f"loss: {loss}, accuracy: {accuracy}")
-
-
 def softmax_cross_entropy_with_integer_labels(logits, labels):
     """Computes softmax cross entropy between sets of logits and integer labels.
     Measures the probability error in discrete classification tasks in which
@@ -248,12 +240,53 @@ def softmax_cross_entropy_with_integer_labels(logits, labels):
     logits_max = jnp.max(logits, axis=-1, keepdims=True)
     logits -= jax.lax.stop_gradient(logits_max)
 
-    no_ignore = labels!=-100
+    no_ignore = jax.lax.stop_gradient(labels!=-100)
 
     ignore_labels = jnp.where(no_ignore, labels, jnp.zeros_like(labels))
 
-    total = jnp.sum(jax.lax.stop_gradient(no_ignore))
+    total = jax.lax.stop_gradient(jnp.sum(no_ignore))
 
     label_logits = jnp.take_along_axis(logits, ignore_labels[..., None], axis=-1)[..., 0]
+
     log_normalizers = jnp.log(jnp.sum(jnp.exp(logits), axis=-1))
     return jnp.sum(jnp.where(no_ignore, log_normalizers - label_logits, jnp.zeros_like(labels)))/total
+
+
+# from omegaconf import OmegaConf
+# config = OmegaConf.load('config/meta_opt/offset_sgd.yaml').model
+# config.vocab_size = 1000
+
+# model = StackedAttention(config)
+
+# model_state= model.init(jax.random.PRNGKey(0), jnp.ones([2,10],dtype=int), jnp.full([2,10],False), jnp.ones([2,10], dtype=int))
+
+# print(model_state['constants'])
+
+# features, loss, accuracy = model.apply(model_state, jnp.zeros([1,50],dtype=int), jnp.full([1,50],False), jnp.ones([1,50], dtype=int))
+
+# # grad_fn = jax.grad(lambda *args: model.apply(*args)[1])
+
+# # grad = grad_fn(model_state, jnp.zeros([1,50],dtype=int), jnp.full([1,50],False), jnp.ones([1,50], dtype=int))
+
+# print(f"loss: {loss}, accuracy: {accuracy}")
+
+
+
+# logits = np.array(
+#     [[10.0 ,4.0 ,5],
+#      [2, 2, 2],
+#      [-1, -3, 4]]
+# )
+
+# labels = np.array(
+#     [0, 2, -100]
+# )
+
+# s = softmax_cross_entropy_with_integer_labels(logits, labels)
+
+# print(f"loss: {s}")
+
+# import torch
+
+
+# print(f" torch: ",torch.nn.functional.cross_entropy(torch.tensor(logits), torch.tensor(labels)))

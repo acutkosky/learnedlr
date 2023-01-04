@@ -78,8 +78,8 @@ def adamw(loss_and_grad_fn, rng, model_and_example_state, opt_state, scale=jnp.a
     constants = model_state['constants']
     # other_values = {key: value for key, value in model_state.iter_items() if key != params}
 
-    m = opt_state['m']
-    v = opt_state['v']
+    m_cur = opt_state['m']
+    v_cur = opt_state['v']
     lr = opt_state['lr']
     beta1 = opt_state['beta1']
     beta2 = opt_state['beta2']
@@ -88,9 +88,9 @@ def adamw(loss_and_grad_fn, rng, model_and_example_state, opt_state, scale=jnp.a
     count = opt_state['count']
     
 
-    m_next = tree_map(lambda old_m, g: old_m * beta1 + g * (1.0 - beta2), m, grad)
+    m_next = tree_map(lambda old_m, g: old_m * beta1 + g * (1.0 - beta1), m_cur, grad)
 
-    v_next = tree_map(lambda old_v, g: old_v * beta2 + (g**2) * (1.0 - beta2), v, grad)
+    v_next = tree_map(lambda old_v, g: old_v * beta2 + (g**2) * (1.0 - beta2), v_cur, grad)
     
     count_next = count + 1
 
@@ -110,7 +110,7 @@ def adamw(loss_and_grad_fn, rng, model_and_example_state, opt_state, scale=jnp.a
     v_hat = tree_map(lambda v: v / (1.0 - beta2**count_next), v_next)
 
     param_next = tree_map(
-        lambda p, m_hat, v_hat: p - scale * lr * m_hat/(epsilon+jnp.sqrt(v_hat)),
+        lambda p, m, v: p - scale * (lr * m/(epsilon+jnp.sqrt(v)) + wd * p),
         params,
         m_hat,
         v_hat)
@@ -191,8 +191,8 @@ def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_
     constants = model_state['constants']
     # other_values = {key: value for key, value in model_state.iter_items() if key != params}
 
-    m = opt_state['m']
-    v = opt_state['v']
+    m_cur = opt_state['m']
+    v_cur = opt_state['v']
     lr = opt_state['lr']
     beta1 = opt_state['beta1']
     beta2 = opt_state['beta2']
@@ -230,9 +230,9 @@ def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_
     offset = jnp.clip(ol_state['prediction'], a_min=lower_bound*scale-scale, a_max=upper_bound*scale-scale)
     
 
-    m_next = tree_map(lambda old_m, g: old_m * beta1 + g * (1.0 - beta2), m, grad)
+    m_next = tree_map(lambda old_m, g: old_m * beta1 + g * (1.0 - beta1), m_cur, grad)
 
-    v_next = tree_map(lambda old_v, g: old_v * beta2 + (g**2) * (1.0 - beta2), v, grad)
+    v_next = tree_map(lambda old_v, g: old_v * beta2 + (g**2) * (1.0 - beta2), v_cur, grad)
     
     count_next = count + 1
 

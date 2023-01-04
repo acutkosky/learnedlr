@@ -9,6 +9,7 @@ import time
 from tqdm import tqdm
 # from matplotlib import pyplot as plt
 from model_jax import StackedAttention
+import model_jax_pt
 import onlineopt
 from omegaconf import OmegaConf
 from omegaconf.errors import ConfigAttributeError
@@ -101,7 +102,7 @@ class Trainer:
         self.rng = rng
         self.config = config
         self.model_state = model_state
-        self.model_apply = jax.jit(model_apply)
+        self.model_apply = model_apply
         self.tokenizer = tokenizer
 
         self.current_lr = config.lr
@@ -508,7 +509,9 @@ def initialize_and_train_model(config):
 
     # print("ready to configure model...")
 
-    attention_model = StackedAttention(model_config)
+    # attention_model = StackedAttention(model_config)
+
+    model_state, model_apply, *_ = model_jax_pt.StackedAttention.init(model_config)
 
 
 
@@ -519,16 +522,21 @@ def initialize_and_train_model(config):
     rng, valid_rng = jax.random.split(rng)
 
 
-    model_state = attention_model.init(init_rng, jnp.ones([2,10],dtype=int), jnp.full([2,10],False), jnp.ones([2,10], dtype=int))
+    # model_state = attention_model.init(init_rng, jnp.ones([2,4000],dtype=int), jnp.full([2,4000],False), jnp.ones([2,4000], dtype=int))
 
     print("about to train...")
 
     tokenizer = transformers.GPT2TokenizerFast.from_pretrained('gpt2')
     tokenizer.pad_token = tokenizer.eos_token
 
-    trainer = Trainer(train_rng, model_state, attention_model.apply, train_config, tokenizer)
+    # trainer = Trainer(train_rng, model_state, attention_model.apply, train_config, tokenizer)
     
-    validator = Validator(valid_rng, jax.jit(attention_model.apply), train_config, tokenizer)
+    # validator = Validator(valid_rng, jax.jit(attention_model.apply), train_config, tokenizer)
+
+
+    trainer = Trainer(train_rng, model_state, model_apply, train_config, tokenizer)
+    
+    validator = Validator(valid_rng, jax.jit(model_apply), train_config, tokenizer)
 
     for e in range(train_config.epochs):
         print(f"starting epoch {e+1}")

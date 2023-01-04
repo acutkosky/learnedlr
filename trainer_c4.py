@@ -9,6 +9,9 @@ import time
 from tqdm import tqdm
 # from matplotlib import pyplot as plt
 from model import StackedAttention
+
+import model_jax_pt
+
 import onlineopt
 from omegaconf import OmegaConf
 from omegaconf.errors import ConfigAttributeError
@@ -430,7 +433,10 @@ def initialize_and_train_model(config):
 
     print("ready to configure model...")
 
-    attention_model = StackedAttention(model_config).to(device)
+    # attention_model = StackedAttention(model_config).to(device)
+
+    
+    attention_model = model_jax_pt.StackedAttention.init(model_config)[2].to(device)
 
     print("about to train...")
 
