@@ -4,6 +4,8 @@ from jax import numpy as jnp
 import numpy as np
 import functools
 
+import optax
+
 from jax.tree_util import tree_map, tree_reduce
 
 def broadcast(to_broadcast, broadcast_to):
@@ -21,9 +23,8 @@ def tree_dot(a, b):
         )
     )
 
-def adamw_init(params, lr=1e-3, beta1=0.9, beta2=0.99, wd=0.0, epsilon=1e-8):
+def adamw_init(params, beta1=0.9, beta2=0.99, wd=0.0, epsilon=1e-8):
     adamw_state = {
-        'lr': jnp.array(lr),
         'beta1': jnp.array(beta1),
         'beta2': jnp.array(beta2),
         'wd': jnp.array(wd),
@@ -37,7 +38,7 @@ def adamw_init(params, lr=1e-3, beta1=0.9, beta2=0.99, wd=0.0, epsilon=1e-8):
 
 
 
-def adamw(loss_and_grad_fn, rng, model_and_example_state, opt_state, scale=jnp.array(1.0), do_logging=False):
+def adamw(loss_and_grad_fn, rng, model_and_example_state, opt_state, lr=jnp.array(1.0), do_logging=False):
     '''
         computes and optimizer update step.
             rng: jax rng
@@ -56,7 +57,9 @@ def adamw(loss_and_grad_fn, rng, model_and_example_state, opt_state, scale=jnp.a
                 same pytree shape as params.
 
             opt_state: state of optimizer
-            scale: scaling value (e.g. a learning rate).
+            lr: scaling value (e.g. a learning rate).
+
+            do_logging: flag for whether to output logging info
         
         returns:
             rng, value, grad, model_state, opt_state, log_dict
@@ -80,7 +83,6 @@ def adamw(loss_and_grad_fn, rng, model_and_example_state, opt_state, scale=jnp.a
 
     m_cur = opt_state['m']
     v_cur = opt_state['v']
-    lr = opt_state['lr']
     beta1 = opt_state['beta1']
     beta2 = opt_state['beta2']
     wd = opt_state['wd']
@@ -96,7 +98,6 @@ def adamw(loss_and_grad_fn, rng, model_and_example_state, opt_state, scale=jnp.a
 
 
     opt_state_next = {
-        'lr': lr,
         'm': m_next,
         'v': v_next,
         'beta1': beta1,
@@ -110,7 +111,7 @@ def adamw(loss_and_grad_fn, rng, model_and_example_state, opt_state, scale=jnp.a
     v_hat = tree_map(lambda v: v / (1.0 - beta2**count_next), v_next)
 
     param_next = tree_map(
-        lambda p, m, v: p - scale * (lr * m/(epsilon+jnp.sqrt(v)) + wd * p),
+        lambda p, m, v: p - lr * ( m/(epsilon+jnp.sqrt(v)) + wd * p),
         params,
         m_hat,
         v_hat)
@@ -128,10 +129,154 @@ def adamw(loss_and_grad_fn, rng, model_and_example_state, opt_state, scale=jnp.a
 
     return rng, value, grad, model_state_next, opt_state_next, log_dict
 
+def adamw_optax_learned_lr_init(multiply, params,  ol_init, beta1=0.9, beta2=0.99, wd=0.0, epsilon=1e-8, lower_bound=1e-8, upper_bound=10, clip=1.0, *args, **kwargs):
+    '''
+    learns a (residual) learning rate for adamw, as implemented by optax.
 
-def adamw_learned_lr_init(params, ol_init, lr=1e-3, beta1=0.9, beta2=0.99, wd=0.0, epsilon=1e-8, lower_bound=1e-8, upper_bound=10, *args, **kwargs):
+    arguments:
+        params: model parameters (pytree)
+        ol_init: function that returns the initial state for an online learner.
+        beta1, beta2: adamw beta parameters
+        wd: weight decay
+        epsilon: adamw epsilon
+        lower_bound: the learned learning rate, base_lr + residual, is not allowed to be smaller than lower_bound * base_lr
+        upper_bound: the learned learning rate, base_lr + residual, is not allowed to be bigger than upper_bound * base_lr
+        clip: clip each gradient to this norm.
+        *args, **kwargs: arguments to ol_init.
+
+    returns:
+        state: pytree optimizer state.
+        update_fn: a function that can perform the update.
+            the first argument to update_fn is the update function for the online learning.
+            probably you should wrap it in a partial so that it can be jitted.
+    '''
+    adamw = optax.adamw(learning_rate=1.0, b1=beta1, b2=beta2, weight_decay=wd, eps=epsilon)
     state = {
-        'lr': jnp.array(lr),
+        'adamw_state': adamw.init(params),
+        'prev_update': tree_map(lambda x: jnp.zeros_like(x), params),
+        'prev_lr_residual': jnp.zeros(1),
+        'lower_bound': lower_bound,
+        'upper_bound': upper_bound,
+        'clip': clip,
+        'ol_state': ol_init(jnp.zeros(1), *args, **kwargs),
+    }
+    return state, functools.partial(adamw_optax_learned_lr_update, multiply, adamw)
+
+def adamw_optax_learned_lr_update(multiply, adamw, ol_update_fn, loss_and_grad_fn, rng, model_and_example_state, opt_state, lr=jnp.array(1.0), do_logging=False):
+
+    value, grad = loss_and_grad_fn(model_and_example_state)
+
+    model_state = model_and_example_state['model_state']
+
+    params = model_state['params']
+    constants = model_state['constants']
+    # other_values = {key: value for key, value in model_state.iter_items() if key != params}
+
+    adamw_state = opt_state['adamw_state']
+    prev_update = opt_state['prev_update']
+    prev_lr_residual = opt_state['prev_lr_residual']
+    ol_state = opt_state['ol_state']
+    lower_bound = opt_state['lower_bound']
+    upper_bound = opt_state['upper_bound']
+    clip = opt_state['clip']
+
+
+    # clip gradients
+    grad = tree_map(
+        lambda g: g * jnp.minimum(1.0, clip/(1e-8+ jnp.linalg.norm(g))),
+        grad
+    )
+
+
+
+    # compute gradient with respect to residual
+    res_grad = tree_dot(prev_update, grad)
+
+
+    cur_rng, rng  = jax.random.split(rng)
+
+    rand_scaling = jax.random.uniform(cur_rng)
+
+
+    # recover previous prediction. Note that this is the UNCONSTRAINED residual
+    ol_prediction = ol_state['prediction']
+
+    # apply constraint set reduction for 1-D intervals.
+    # this modifies the residual gradient to correctly preserve regret bounds
+    # over clipping (note that simply differentiating through the clipping operation
+    # does NOT preserve regret as it would zero-out the gradient whenever clipping occurs).
+    res_grad = jnp.where(
+        -(ol_prediction - prev_lr_residual) * jnp.sign(res_grad) > 1e-8, # should be == 0 when no clipping happens, but idk about floating point stuff.
+        jnp.zeros_like(res_grad),
+        res_grad)
+
+
+    # perform online learning update on residual. The residual will be the "prediction" of the online learner.
+    ol_state, ol_logs = ol_update_fn(res_grad, ol_state)
+
+
+    # clip residual to within bounds
+    if multiply:
+        residual = jnp.clip(ol_state['prediction'], a_min=jnp.log(lower_bound), a_max=jnp.log(upper_bound))
+    else:
+        residual = jnp.clip(ol_state['prediction'], a_min=lower_bound*lr - lr, a_max=upper_bound*lr - lr)
+    
+
+    update, adamw_state_next = adamw.update(grad,  adamw_state, params)
+
+
+    if multiply:
+        learned_lr = lr * jnp.exp(rand_scaling * residual)
+        update = tree_map(
+            lambda u: lr * jnp.exp(rand_scaling * residual) * u,
+            update)
+        # multiply e^residual by lr
+        param_next = tree_map(
+            lambda p, u: p + u,
+            params,
+            update)
+    else:
+        learned_lr = (lr + rand_scaling * residual)
+        # add mode: add residual with random scaling to the lr
+        param_next = tree_map(
+            lambda p, u: p + learned_lr * u,
+            params,
+            update)
+
+
+
+    opt_state_next = {
+        'adamw_state': adamw_state_next,
+        'prev_update': update,
+        'prev_lr_residual': residual,
+        'lower_bound': lower_bound,
+        'upper_bound': upper_bound,
+        'ol_state': ol_state,
+        'clip': clip,
+    }
+
+    model_state_next = {
+        'constants': constants,
+        'params': param_next
+    }
+
+
+    if do_logging:
+        log_dict = {
+            'learned_lr': learned_lr,
+            # 'expected_learned_lr': lr + 0.5*residual,
+            'residual': residual,
+        }
+        log_dict.update(ol_logs)
+    else:
+        log_dict = None
+
+    return rng, value, grad, model_state_next, opt_state_next, log_dict
+
+
+
+def adamw_learned_lr_init(params, ol_init, beta1=0.9, beta2=0.99, wd=0.0, epsilon=1e-8, lower_bound=1e-8, upper_bound=10, *args, **kwargs):
+    state = {
         'beta1': jnp.array(beta1),
         'beta2': jnp.array(beta2),
         'wd': jnp.array(wd),
@@ -140,9 +285,10 @@ def adamw_learned_lr_init(params, ol_init, lr=1e-3, beta1=0.9, beta2=0.99, wd=0.
         'm': tree_map(lambda x: jnp.zeros_like(x), params),
         'v': tree_map(lambda x: jnp.zeros_like(x), params),
         'prev_update': tree_map(lambda x: jnp.zeros_like(x), params),
-        'prev_lr_offset': jnp.zeros(1),
+        'prev_lr_residual': jnp.zeros(1),
         'lower_bound': lower_bound,
         'upper_bound': upper_bound,
+        'max_lr': jnp.array(0.0),
         'ol_state': ol_init(jnp.zeros(1), *args, **kwargs),
     }
     return state
@@ -150,7 +296,7 @@ def adamw_learned_lr_init(params, ol_init, lr=1e-3, beta1=0.9, beta2=0.99, wd=0.
 
 
 
-def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_state, opt_state, scale=jnp.array(1.0), do_logging=False):
+def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_state, opt_state, lr=jnp.array(1.0), do_logging=False):
     '''
         computes and optimizer update step.
             rng: jax rng
@@ -169,7 +315,9 @@ def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_
                 same pytree shape as params.
 
             opt_state: state of optimizer
-            scale: scaling value (e.g. a learning rate).
+            lr: scaling value (e.g. a learning rate).
+
+            do_logging: flag for whether to output logging info
         
         returns:
             rng, value, grad, model_state, opt_state, log_dict
@@ -193,23 +341,24 @@ def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_
 
     m_cur = opt_state['m']
     v_cur = opt_state['v']
-    lr = opt_state['lr']
     beta1 = opt_state['beta1']
     beta2 = opt_state['beta2']
     wd = opt_state['wd']
     epsilon = opt_state['epsilon']
     count = opt_state['count']
     prev_update = opt_state['prev_update']
-    prev_lr_offset = opt_state['prev_lr_offset']
+    prev_lr_residual = opt_state['prev_lr_residual']
     ol_state = opt_state['ol_state']
     lower_bound = opt_state['lower_bound']
     upper_bound = opt_state['upper_bound']
+    max_lr = opt_state['max_lr']
 
 
     ol_prediction = ol_state['prediction']
 
 
-    scale_grad = tree_dot(prev_update, grad)
+    # compute gradient with respect to residual
+    res_grad = tree_dot(prev_update, grad)
 
 
     cur_rng, rng  = jax.random.split(rng)
@@ -217,19 +366,25 @@ def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_
     rand_scaling = jax.random.uniform(cur_rng)
 
 
-    # apply constraint set reduction for 1-D intervals
-    scale_grad = jnp.where(
-        -(ol_prediction - prev_lr_offset) * jnp.sign(scale_grad) > 1e-8, # should be == 0 when no clipping happens, but idk about floating point stuff.
-        jnp.zeros_like(scale_grad),
-        scale_grad)
+    # apply constraint set reduction for 1-D intervals.
+    # this modifies the residual gradient to correctly preserve regret bounds
+    # over clipping (note that simply differentiating through the clipping operation
+    # does NOT preserve regret as it would zero-out the gradient whenever clipping occurs).
+    res_grad = jnp.where(
+        -(ol_prediction - prev_lr_residual) * jnp.sign(res_grad) > 1e-8, # should be == 0 when no clipping happens, but idk about floating point stuff.
+        jnp.zeros_like(res_grad),
+        res_grad)
 
-    ol_state, ol_logs = ol_update(scale_grad, ol_state)
+
+    # perform online learning update on residual. The residual will be the "prediction" of the online learner.
+    ol_state, ol_logs = ol_update(res_grad, ol_state)
 
 
-
-    offset = jnp.clip(ol_state['prediction'], a_min=lower_bound*scale-scale, a_max=upper_bound*scale-scale)
+    # clip residual to within bounds
+    residual = jnp.clip(ol_state['prediction'], a_min=lower_bound*lr - lr, a_max=upper_bound*lr - lr)
     
 
+    # compute adamw update
     m_next = tree_map(lambda old_m, g: old_m * beta1 + g * (1.0 - beta1), m_cur, grad)
 
     v_next = tree_map(lambda old_v, g: old_v * beta2 + (g**2) * (1.0 - beta2), v_cur, grad)
@@ -246,15 +401,18 @@ def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_
         params,
     )
 
+
+    max_lr_next = jnp.maximum(max_lr, lr + rand_scaling * residual)
+
+    # add residual with random scaling to the lr
     param_next = tree_map(
-        lambda p, u: p + (scale + rand_scaling * offset) * u,
+        lambda p, u: p + (lr + rand_scaling * residual) * u,
         params,
         update)
 
 
 
     opt_state_next = {
-        'lr': lr,
         'beta1': beta1,
         'beta2': beta2,
         'wd': wd,
@@ -263,10 +421,11 @@ def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_
         'm': m_next,
         'v': v_next,
         'prev_update': update,
-        'prev_lr_offset': offset,
+        'prev_lr_residual': residual,
         'lower_bound': lower_bound,
         'upper_bound': upper_bound,
         'ol_state': ol_state,
+        'max_lr': max_lr_next,
     }
 
     model_state_next = {
@@ -277,7 +436,10 @@ def adamw_learned_lr_update(ol_update, loss_and_grad_fn, rng, model_and_example_
 
     if do_logging:
         log_dict = {
-            'learned_lr': scale + offset,
+            'learned_lr': lr + rand_scaling*residual,
+            'expected_learned_lr': lr + 0.5*residual,
+            'max_learned_lr': max_lr_next,
+            'residual': residual,
         }
         log_dict.update(ol_logs)
     else:
@@ -613,7 +775,7 @@ def ogd_update(grad, opt_state, max_bound=None, min_bound=None):
 
 def cb_init(params, eps=1.0, eta=2.0/(2-np.log(3)), decay=1.0):
     state = {}
-    state['wealth'] = tree_map(lambda x: jnp.full_like(x, fill_value=eps), params)
+    state['wealth'] = tree_map(lambda x: jnp.zeros_like(x), params)
     state['bet_fractions'] = tree_map(lambda x: jnp.zeros_like(x), params)
     state['bet_grad_squared_sum'] = tree_map(lambda x: jnp.full_like(x, fill_value=1e-8), params)
     state['max_grads'] = tree_map(lambda x: jnp.full_like(x, fill_value=1e-8), params)
@@ -626,14 +788,6 @@ def cb_init(params, eps=1.0, eta=2.0/(2-np.log(3)), decay=1.0):
 
     return state
 
-
-def cb_reset(state):
-    state['wealth'] = tree_map(lambda x: jnp.full_like(x, fill_value=state['eps']), state['wealth'])
-    state['bet_fractions'] = tree_map(lambda x: jnp.zeros_like(x), state['bet_fractions'])
-    state['bet_grad_squared_sum'] = tree_map(lambda x: jnp.full_like(x, fill_value=1e-8), state['bet_grad_squared_sum'])
-    state['max_grads'] = tree_map(lambda x: jnp.full_like(x, fill_value=1e-8), state['max_grads'])
-    state['prediction'] = tree_map(lambda x: jnp.zeros_like(x), state['prediction'])
-    return state    
 
 def cb_update(grad, opt_state, do_logging=False):
     
@@ -663,7 +817,7 @@ def cb_update(grad, opt_state, do_logging=False):
     )
 
     bet_grad_squared_sum_next = tree_map(lambda x, z: x*decay**2 + z**2, bet_grad_squared_sum,  bet_grad)
-    wealth_next = tree_map(lambda r, g, b: r * (decay - b * g), wealth, bet_fractions, grad)
+    wealth_next = tree_map(lambda r, g, b: r * decay - b * g * (r+ eps), wealth, bet_fractions, grad)
     
     
     bet_fractions_next = tree_map(
@@ -675,7 +829,7 @@ def cb_update(grad, opt_state, do_logging=False):
         bet_grad_squared_sum_next,
         max_grads_next)
 
-    param_next = tree_map(lambda r, b: r * b, wealth_next, bet_fractions_next)
+    param_next = tree_map(lambda r, b: (eps + r) * b, wealth_next, bet_fractions_next)
 
     opt_state_next = {
         'wealth': wealth_next,
@@ -707,7 +861,7 @@ def OL_momentum_init(params, ol_init, *args, **kwargs):
         'true_params': params,
         'last_offset': tree_map(lambda x: jnp.zeros_like(x), params),
         'total_reward': 0.0,
-        'epoch_reward': 0.0,
+        # 'epoch_reward': 0.0,
         # 'epoch_count': 0,
         'iteration_count':  0,
         # 'reset_threshold': reset_threshold,
@@ -731,7 +885,7 @@ def OL_momentum_update(ol_update, loss_and_grad_fn, rng, model_and_example_state
     ol_state = opt_state['ol_state']
     true_params = opt_state['true_params']
     total_reward = opt_state['total_reward']
-    epoch_reward = opt_state['epoch_reward']
+    # epoch_reward = opt_state['epoch_reward']
     last_offset = opt_state['last_offset']
     # epoch_count = opt_state['epoch_count']
     iteration_count = opt_state['iteration_count']
@@ -752,7 +906,7 @@ def OL_momentum_update(ol_update, loss_and_grad_fn, rng, model_and_example_state
     )
 
     total_reward_next = total_reward - reward_increment
-    epoch_reward_next = epoch_reward - reward_increment
+    # epoch_reward_next = epoch_reward - reward_increment
 
     
 

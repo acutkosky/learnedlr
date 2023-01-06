@@ -41,7 +41,7 @@ def optax_init(optimizer, model_state):
     return optimizer.init(model_state)
 
 
-def optax_state_and_step(optimizer, model_state, *args, **kwargs):
+def optax_state_and_step(optimizer, model_state, clip, *args, **kwargs):
     optimizer = optimizer(*args,  **kwargs)
 
 
@@ -77,6 +77,13 @@ def optax_state_and_step(optimizer, model_state, *args, **kwargs):
         '''
         print("tracing update step")
         value, grad = loss_and_grad_fn(model_and_example_state)
+
+        # clip gradients
+        grad = jax.tree_util.tree_map(
+            lambda g: g * jnp.minimum(1.0, clip/(1e-8+ jnp.linalg.norm(g))),
+            grad
+        )
+
         # grads = loss_and_grads['grads']
 
         model_state = model_and_example_state['model_state']
@@ -86,10 +93,10 @@ def optax_state_and_step(optimizer, model_state, *args, **kwargs):
 
         # The learning rate scheduler thing in optax seems more complicated than
         # just doing this:
-        updates = jax.tree_util.tree_map(lambda p: scale * p, updates)
+        scaled_updates = jax.tree_util.tree_map(lambda p: scale * p, updates)
 
 
-        params = optax.apply_updates(params, updates)
+        params = optax.apply_updates(params, scaled_updates)
         model_state = {'constants': constants, 'params': params}
         return rng, value, grad, model_state, opt_state, None
     
@@ -102,7 +109,7 @@ class Trainer:
         self.rng = rng
         self.config = config
         self.model_state = model_state
-        self.model_apply = model_apply
+        self.model_apply = jax.jit(model_apply)
         self.tokenizer = tokenizer
 
         self.current_lr = config.lr
@@ -113,7 +120,7 @@ class Trainer:
         if self.config.optimizer == 'adamw':
             # self.optimizer_state = opt_jax.adamw_init(model_state['params'], lr=1.0, beta1=config.beta1, beta2=config.beta2, wd=config.wd)
             # self.optimizer_step = opt_jax.adamw
-            self.optimizer_state, self.optimizer_step = optax_state_and_step(optax.adamw, model_state, learning_rate=1.0, weight_decay=config.wd)
+            self.optimizer_state, self.optimizer_step = optax_state_and_step(optax.adamw, model_state, config.clip, learning_rate=1.0, b1=config.beta1, b2=config.beta2, weight_decay=config.wd)
             # self.optimizer_step = jax.jit(self.optimizer_step)
         if self.config.optimizer == 'custom':
             if self.config.custom_opt.name == 'adamw':
@@ -140,18 +147,20 @@ class Trainer:
 
             if self.config.custom_opt.name == 'adamw_learned_lr':
                 opt_conf = config.custom_opt.adamw_learned_lr
-                self.optimizer_state = opt_jax.adamw_learned_lr_init(
+                
+                self.optimizer_state, opt_update = opt_jax.adamw_optax_learned_lr_init(
+                    opt_conf.multiply,
                     model_state['params'],
                     ol_init=lambda x: opt_jax.cb_init(x, opt_conf.cb.eps, opt_conf.cb.eta, opt_conf.cb.decay),
-                    lr=1.0,
                     beta1=opt_conf.beta1,
                     beta2=opt_conf.beta2,
                     wd=opt_conf.wd,
                     lower_bound=opt_conf.lower_bound,
                     upper_bound=opt_conf.upper_bound,
+                    clip=opt_conf.clip
                 )
                 
-                self.optimizer_step = partial(opt_jax.adamw_learned_lr_update, opt_jax.cb_update)
+                self.optimizer_step = partial(opt_update, opt_jax.cb_update)
 
         # self.losses = []
 
