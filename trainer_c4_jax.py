@@ -2,15 +2,15 @@
 # from torchtext.datasets import WikiText2
 import transformers
 # from transformers import DataCollatorForLanguageModeling
-import torch
+# import torch
 # from torch.utils.data import DataLoader
 import argparse
 import time
 from tqdm import tqdm
 # from matplotlib import pyplot as plt
-from model_jax import StackedAttention
+# from model_jax import StackedAttention
 import model_jax_pt
-import onlineopt
+# import onlineopt
 from omegaconf import OmegaConf
 from omegaconf.errors import ConfigAttributeError
 from optional_module import optional_module
@@ -26,9 +26,11 @@ import opt_jax
 
 from typing import Any
 from jax import numpy as jnp
-from dataclasses import dataclass
+# from dataclasses import dataclass
 
-import gc
+# import gc
+
+to_container = OmegaConf.to_container
 
 parser = argparse.ArgumentParser(description='Simple pretraining thing')
 
@@ -145,22 +147,37 @@ class Trainer:
                 )
                 self.optimizer_step = partial(opt_jax.OL_momentum_update, opt_jax.cb_update)
 
-            if self.config.custom_opt.name == 'adamw_learned_lr':
-                opt_conf = config.custom_opt.adamw_learned_lr
-                
-                self.optimizer_state, opt_update = opt_jax.adamw_optax_learned_lr_init(
-                    opt_conf.multiply,
+            if self.config.custom_opt.name == 'ol_momentum':
+                opt_conf = config.custom_opt.ol_momentum
+                self.optimizer_state, self.optimizer_step = opt_jax.OL_momentum_init(
                     model_state['params'],
-                    ol_init=lambda x: opt_jax.cb_init(x, opt_conf.cb.eps, opt_conf.cb.eta, opt_conf.cb.decay),
-                    beta1=opt_conf.beta1,
-                    beta2=opt_conf.beta2,
-                    wd=opt_conf.wd,
+                    ol_init=getattr(opt_jax, opt_conf.ol_init),
+                    ol_args=to_container(opt_conf.ol_args),
+                    ol_kwargs=to_container(opt_conf.ol_kwargs),
+                    ol_update_fn=getattr(opt_jax, opt_conf.ol_update_fn),
+                    ol_reset_fn=getattr(opt_jax, opt_conf.ol_reset_fn),
+                    reset_threshold=opt_conf.reset_threshold,
+                )
+
+            if self.config.custom_opt.name == 'optax_learned_lr':
+                opt_conf = config.custom_opt.optax_learned_lr
+                
+                self.optimizer_state, self.optimizer_step = opt_jax.optax_learned_lr_init(
+                    model_state['params'],
+                    optax_optimizer=getattr(optax, opt_conf.optax_optimizer),
+                    optax_args=to_container(opt_conf.optax_args),
+                    optax_kwargs=to_container(opt_conf.optax_kwargs),
+                    ol_init=getattr(opt_jax, opt_conf.ol_init),
+                    ol_args=to_container(opt_conf.ol_args),
+                    ol_kwargs=to_container(opt_conf.ol_kwargs),
+                    ol_update_fn=getattr(opt_jax, opt_conf.ol_update_fn),
                     lower_bound=opt_conf.lower_bound,
                     upper_bound=opt_conf.upper_bound,
-                    clip=opt_conf.clip
+                    clip=opt_conf.clip,
+                    multiply=opt_conf.multiply,
+                    additive_bounds=opt_conf.additive_bounds,
                 )
-                
-                self.optimizer_step = partial(opt_update, opt_jax.cb_update)
+
 
         # self.losses = []
 
@@ -604,10 +621,11 @@ if __name__=='__main__':
 
     wandb = optional_module(wandb, config.train.logging)
     wandb.init(project=config.train.wandb_project)
-    wandb.config.update({
-        'train': config.train._content,
-        'model': config.model._content,
-        })
+    wandb.config.update(OmegaConf.to_container(config))
+    # {
+    #     'train': OmegaConf.to_container(config.train), #._content,
+    #     'model': OmegaConf.to_container(config.model),#._content,
+    #     })
     initialize_and_train_model(config)
 
 
