@@ -299,6 +299,278 @@ def optax_rand_scaled_update(
 
 
 
+def optax_ol_scaled_init(
+    params,
+    optax_optimizer,
+    optax_args,
+    optax_kwargs,
+    ol_update_fn,
+    ol_init,
+    ol_args,
+    ol_kwargs,
+    clip=1.0,
+    clip_ol=1.0,
+    lower_bound=0.0,
+    upper_bound=1.0,
+    rand_scaling_type='uniform',
+    use_loss_diff=False,
+    **_kwargs):
+    '''
+    scales an optax optimizer by a random amount.
+
+    arguments:
+        params: model parameters (pytree)
+
+        optax_optimizer: optimizer class from optax to use as base update generator.
+        optax_args: argument list for optax optimizer
+        optax_kwargs: keyword argument dict for optax optimizer
+
+        ol_init: function that returns the initial state for an online learner.
+        ol_args: argument list for ol_init
+        ol_kwargs: keyword argument dict for ol_init.
+
+        ol_update_fn: update function for the online learner.
+
+        clip: clip each variable of the gradient to have this norm
+        clip_ol: clip the meta-online learning gradient to have this norm
+
+        lower_bound: lower bound for learned lr
+        upper_bound: upper bound for learned lr
+        
+        rand_scaling_type: string, specifies which type of random scaling.
+            can be 'none' (just regular adamw), 'uniform' (uniform in [0,1]),
+            or 'exponential' (from an exponential distribution with mean 1),
+            or 'half': scale by 0.5
+
+        use_loss_diff: if true, we will rescale the gradient so that
+            <gradient , update> = loss(param + update) - loss(param)
+
+
+    returns:
+        state: pytree optimizer state.
+        update_fn: a function that can perform the update.
+    '''
+    optax_opt = optax_optimizer(*optax_args, **optax_kwargs)
+    state = {
+        'optax_state': optax_opt.init(params),
+        'ol_state': ol_init(jnp.zeros(1), *ol_args, **ol_kwargs),
+        'clip': clip,
+        'clip_ol': clip_ol,
+        'prev_update': zeros_like(params),
+        'true_params': params,
+        'prev_true_params': params,
+        'prev_rand_update_scaling': jnp.ones(1),
+        'prev_true_update_scaling': jnp.ones(1),
+        'constraint_violation': jnp.zeros(1),
+        'lower_bound': lower_bound,
+        'upper_bound': upper_bound,
+        'prev_lr': jnp.zeros(1),
+    }
+    return state, functools.partial(
+        optax_ol_scaled_update,
+        rand_scaling_type,
+        use_loss_diff,
+        ol_update_fn,
+        optax_opt)
+
+def optax_ol_scaled_update(
+    rand_scaling_type,
+    use_loss_diff,
+    ol_update,
+    optax_opt,
+    loss_and_grad_fn,
+    rng,
+    model_and_example_state,
+    opt_state,
+    lr=jnp.array(1.0),
+    do_logging=False):
+    '''
+    update function for random scaling of optax lrs
+
+    arguments:
+        rand_scaling_type: string, specifies which type of random scaling.
+            can be 'none' (just regular adamw), 'uniform' (uniform in [0,1]),
+            or 'exponential' (from an exponential distribution with mean 1),
+            or 'half': scale by 0.5
+        use_loss_diff: if true, we will rescale the gradient so that
+            <gradient , update> = loss(param + update) - loss(param)
+        ol_update: update function for online learner
+        optax_opt: optax optimizer object.
+            *** these first arguments will be set by optax_rand_scaled_init via a partial because they cannot be jitted.
+            *** (e.g. some are options checked by python conditionals)
+        
+        loss_and_grad_fn: a function that takes as input a pytree containing model state and minibatch example info and returns a 
+            tuple (value, grad). "value" should be a dict that has at least one key 'loss'
+            containing the loss value (this key is only used if use_loss_diff is True).
+            *** this one is probably not a JAX type, so to jit you need to make it a static argument or wrap in a partial!
+
+        rng: JAX rng
+        model_and_example_state: input pytree to loss_and_grad_fn.
+            This is assumed to be a dictionary containing a key 'model_state'.
+            model_and_example_state['model_state'] should be the state of a Flax model, and so should contain two
+            keys: 'params' and 'constants'. model_and_example_state['model_state']['params'] are the parameters to be
+            optimized. 'constants' are just constants (i.e. constant attention masks or other buffers).
+        opt_state: state of the optimizer (pytree).
+        lr: current learning rate.
+
+        do_logging: a flag that tells whether to output some additional logging info in a dictionary.
+            *** This is checked via python conditional, so it should probably be a "static" argument when jitting or wrapped in a partial!
+
+    returns:
+        rng: next value for JAX rng
+        value: loss value from loss_and_grad_fn. Should have at least one key "loss" that holds the loss.
+        grad: gradient value from loss_and_grad_fn
+        model_state_next: next value for model_state (i.e this will be the next value for model_and_example_state['model_state'])
+        opt_state_next: next value for optimizer state (i.e. this will be the next value for opt_state)
+        log_dict: dictionary of logging info. Is set to None if do_logging=False.
+    '''
+
+
+    
+    optax_state = opt_state['optax_state']
+    clip = opt_state['clip']
+    clip_ol = opt_state['clip_ol']
+    true_params = opt_state['true_params']
+    prev_true_params = opt_state['prev_true_params']
+    prev_update = opt_state['prev_update']
+    prev_rand_update_scaling = opt_state['prev_rand_update_scaling']
+    prev_true_update_scaling = opt_state['prev_true_update_scaling']
+    ol_state = opt_state['ol_state']
+    constraint_violation = opt_state['constraint_violation']
+    lower_bound = opt_state['lower_bound']
+    upper_bound = opt_state['upper_bound']
+    prev_lr = opt_state['prev_lr']
+
+
+    model_state = model_and_example_state['model_state']
+
+    params = model_state['params']
+    constants = model_state['constants']
+
+
+    value, grad = loss_and_grad_fn(model_and_example_state)
+
+
+
+
+    if use_loss_diff:
+        model_and_example_state['model_state']['params'] = true_params
+
+
+        true_loss, _ = loss_and_grad_fn(model_and_example_state)
+
+
+        model_and_example_state['model_state']['params'] = prev_true_params
+
+        prev_true_loss, _ = loss_and_grad_fn(model_and_example_state)
+
+        loss_diff = true_loss['loss'] - prev_true_loss['loss']
+
+        ol_grad = loss_diff/(1e-8 + prev_lr)
+    else:
+        ol_grad = tree_dot(grad, prev_update)
+
+    ol_grad = jnp.where(
+            -constraint_violation * jnp.sign(ol_grad) > 1e-8, # should be == 0 when no clipping happens, but idk about floating point stuff.
+            jnp.zeros_like(ol_grad),
+            ol_grad)
+    # clip ol_grad
+    ol_grad = tree_map(
+        lambda x: x * jnp.minimum(1.0, clip_ol/(1e-8 + jnp.linalg.norm(x))),
+        ol_grad
+    )
+    
+    ol_state_next, ol_logs = ol_update(ol_grad, ol_state, do_logging)
+
+    unclipped_final_lr = lr + ol_state_next['prediction']
+
+    final_lr = jnp.clip(unclipped_final_lr, a_min=lower_bound, a_max=upper_bound)
+
+    constraint_violation_next = unclipped_final_lr - final_lr
+
+
+
+    if rand_scaling_type == 'uniform':
+        cur_rng, rng  = jax.random.split(rng)
+        rand_scaling = jax.random.uniform(cur_rng)
+        rand_scaled_lr = rand_scaling * final_lr
+        true_scaled_lr = final_lr
+    elif rand_scaling_type == 'exponential':
+        cur_rng, rng  = jax.random.split(rng)
+        rand_scaling = -jnp.log(jax.random.uniform(cur_rng))
+        rand_scaled_lr = rand_scaling * final_lr
+        true_scaled_lr = rand_scaling * final_lr # the point of exponential is that these are the same!
+    elif rand_scaling_type == 'half':
+        rand_scaled_lr = 0.5 * final_lr
+        true_scaled_lr = final_lr
+    elif rand_scaling_type == 'none':        
+        rand_scaled_lr = final_lr
+        true_scaled_lr = final_lr
+    else:
+        raise(NotImplementedError, "unknown rand scaling!")
+
+
+    # clip gradients
+    grad = clip_by_variable_norm(grad, clip)
+    update, optax_state_next = optax_opt.update(grad,  optax_state, params)
+
+
+    param_next = tree_map(
+        lambda p, u: p + rand_scaled_lr * u,
+        true_params,
+        update)
+
+    true_params_next = tree_map(
+        lambda p, u: p + true_scaled_lr * u,
+        true_params,
+        update)
+
+
+
+    opt_state_next = {
+        'optax_state': optax_state_next,
+        'ol_state': ol_state_next,
+        'prev_update': update,
+        'prev_rand_update_scaling': rand_scaled_lr,
+        'prev_true_update_scaling': true_scaled_lr,
+        'true_params': true_params_next,
+        'prev_true_params': true_params,
+        'clip': clip,
+        'clip_ol': clip_ol,
+        'lower_bound': lower_bound,
+        'upper_bound': upper_bound,
+        'constraint_violation': constraint_violation_next,
+        'prev_lr': final_lr
+    }
+
+    model_state_next = {
+        'constants': constants,
+        'params': param_next
+    }
+
+
+    if do_logging:
+        log_dict = {
+            'rand_scaled_lr': rand_scaled_lr,
+            'learned_lr': final_lr,
+            'unconstrained_residual': ol_state_next['prediction'],
+        }
+
+        log_dict.update(ol_logs)
+
+        if use_loss_diff:
+            log_dict['loss_diff'] = loss_diff
+        
+    else:
+        log_dict = None
+
+    return rng, value, grad, model_state_next, opt_state_next, log_dict
+
+
+
+
+
+
 
 
 def OL_momentum_init(params, ol_init, ol_args, ol_kwargs, ol_update_fn, ol_reset_fn, reset_threshold=100.0):
@@ -506,3 +778,148 @@ def adagrad_update(grad, opt_state, do_logging=False):
     }
 
     return opt_state_next, {}
+
+
+
+
+def cb_stable_init(params, eps=1.0, eta=1.0, decay=1.0, stability=0.0, grad_stab=0.0):
+    state = {
+        'wealth': tree_map(lambda x: jnp.full_like(x, fill_value=eps), params), #zeros_like(params),
+        'bet_fractions': zeros_like(params),
+        'subepoch_grad': zeros_like(params),
+        'max_grads': zeros_like(params),
+        'subepoch_grad_abs_sum': zeros_like(params),
+        'subepoch_grad_sum': zeros_like(params),
+        'eps': eps,
+        'decay': decay,
+        'stability': stability,
+        'grad_stab': grad_stab,
+        'eta': eta,
+        'prediction': zeros_like(params),
+        'subepoch_count': zeros_like(params),
+    }
+
+    return state
+
+
+def cb_stable_reset(old_state, count):
+    state = {
+        'wealth': tree_map( lambda x: jnp.full_like(x, fill_value=old_state['eps']/(count+1)), old_state['wealth']),
+        'bet_fractions': zeros_like(old_state['bet_fractions']),
+        'subepoch_grad': zeros_like(old_state['subepoch_grad']),
+        'max_grads': old_state['max_grads'],
+        'subepoch_grad_abs_sum': zeros_like(old_state['subepoch_grad_abs_sum']),
+        'subepoch_grad_sum': zeros_like(old_state['subepoch_grad_sum']),
+        'eta': old_state['eta'],
+        'eps': old_state['eps']/(count + 1),
+        'decay': old_state['decay'],
+        'stability': old_state['stability'],
+        'grad_stab': old_state['grad_stab'],
+        'prediction': zeros_like(old_state['prediction']),
+        'subepoch_count': zeros_like(old_state['subepoch_count']),
+    }
+    return state
+
+def cb_stable_update(grad, opt_state, do_logging=False):
+    
+    wealth = opt_state['wealth']
+    bet_fractions = opt_state['bet_fractions']
+    subepoch_grad = opt_state['subepoch_grad']
+    max_grads = opt_state['max_grads']
+    eps = opt_state['eps']
+    decay = opt_state['decay']
+    stability = opt_state['stability']
+    grad_stab = opt_state['grad_stab']
+    subepoch_grad_abs_sum = opt_state['subepoch_grad_abs_sum']
+    subepoch_grad_sum = opt_state['subepoch_grad_sum']
+    eta = opt_state['eta']
+    subepoch_count = opt_state['subepoch_count']
+
+
+
+    current_stab = tree_map(lambda m: stability + grad_stab * m, max_grads)
+
+    max_grads_next = tree_map(lambda m, g: jnp.maximum(m * decay, jnp.abs(g)), max_grads, grad)
+
+    grad = tree_map(lambda g, m: jnp.clip(g, a_min=-m, a_max=m), grad, max_grads)
+
+    subepoch_grad_next = tree_map(lambda s, g: s + g, subepoch_grad, grad)
+
+    end_subepoch_mask = tree_map(lambda s, t: jnp.abs(s) > t, subepoch_grad_next, current_stab)
+
+    subepoch_count_next = tree_map(lambda c, m: c + m, subepoch_count, end_subepoch_mask)
+
+    subepoch_grad_abs_sum_next = tree_map(
+        lambda s, m, g: s * decay + m * jnp.abs(g),
+        subepoch_grad_abs_sum,
+        end_subepoch_mask,
+        subepoch_grad_next)
+
+    subepoch_grad_sum_next = tree_map(
+        lambda s, m, g: s*decay + m * g,
+        subepoch_grad_sum,
+        end_subepoch_mask,
+        subepoch_grad_next)
+
+    bet_fractions_next = tree_map(
+        lambda s, d, t, m, b, mask, : jnp.where(mask, -eta * s/(1e-8 + 2 * (m+t) * (t+m + d)), b),
+        subepoch_grad_sum_next,
+        subepoch_grad_abs_sum_next,
+        current_stab,
+        max_grads_next,
+        bet_fractions,
+        end_subepoch_mask,
+    )
+
+    wealth_next = tree_map(
+        lambda w, b, g, m, bn, s: jnp.where(
+            m,
+            w * ( (decay - b*(g+ jnp.sign(g) * s))/(1.0 - s * jnp.sign(g) * bn)),
+            w),
+        wealth,
+        bet_fractions,
+        subepoch_grad_next,
+        end_subepoch_mask,
+        bet_fractions_next,
+        current_stab,
+    )
+
+    prediction = tree_map(
+        lambda w, b: w*b,
+        wealth_next,
+        bet_fractions_next,
+    )
+
+
+
+    subepoch_grad_next = tree_map(
+        lambda s, m: s * jnp.logical_not(m),
+        subepoch_grad_next,
+        end_subepoch_mask
+    )
+
+    state = {
+        'wealth': wealth_next,
+        'bet_fractions': bet_fractions_next,
+        'subepoch_grad': subepoch_grad_next,
+        'subepoch_grad_sum': subepoch_grad_sum_next,
+        'max_grads': max_grads_next,
+        'subepoch_grad_abs_sum': subepoch_grad_abs_sum_next,
+        'eps': eps,
+        'decay': decay,
+        'stability': stability,
+        'grad_stab': grad_stab,
+        'eta': eta,
+        'prediction': prediction,
+        'subepoch_count': subepoch_count_next,
+    }
+
+    return state, {
+        'wealth': tree_map(lambda x: jnp.average(x), wealth_next),
+        'bet_fractions': tree_map(lambda x: jnp.average(x), bet_fractions_next),
+        'max_grad': tree_map(lambda x: jnp.average(x), max_grads_next),
+        'subepoch_grad_sum': tree_map(lambda x: jnp.average(x), subepoch_grad_sum_next),
+        'subepoch_grad': tree_map(lambda x: jnp.average(x), subepoch_grad_next),
+        'subepoch_count': tree_map(lambda x: jnp.average(x), subepoch_count_next),
+        }
+

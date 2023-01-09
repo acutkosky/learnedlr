@@ -209,6 +209,26 @@ class Trainer:
                 )
                 
 
+            if self.config.custom_opt.name == 'optax_ol_scaled':
+                opt_conf = config.custom_opt.optax_ol_scaled
+
+                self.optimizer_state, self.optimizer_step = rand_scaling_opts.optax_ol_scaled_init(
+                    model_state['params'],
+                    optax_optimizer=getattr(optax, opt_conf.optax_optimizer),
+                    optax_args=to_container(opt_conf.optax_args),
+                    optax_kwargs=to_container(opt_conf.optax_kwargs),
+                    ol_init=getattr(rand_scaling_opts, opt_conf.ol_init),
+                    ol_args=to_container(opt_conf.ol_args),
+                    ol_kwargs=to_container(opt_conf.ol_kwargs),
+                    ol_update_fn=getattr(rand_scaling_opts, opt_conf.ol_update_fn),
+                    lower_bound=opt_conf.lower_bound,
+                    upper_bound=opt_conf.upper_bound,
+                    clip=opt_conf.clip,
+                    clip_ol=opt_conf.clip_ol,
+                    rand_scaling_type=opt_conf.rand_scaling_type,
+                    use_loss_diff=opt_conf.use_loss_diff
+                )
+                
 
         # self.losses = []
 

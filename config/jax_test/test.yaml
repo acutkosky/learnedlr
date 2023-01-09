@@ -14,7 +14,7 @@ train:
 
   custom_opt:
 
-    name: 'optax_rand_scaled'
+    name: 'optax_ol_scaled'
     ogd:
       lr: 0.01
     
@@ -122,6 +122,33 @@ train:
       use_loss_diff: true
       rand_scaling_type: none
       clip: 1000.0
+      
+
+
+    optax_ol_scaled:
+      optax_optimizer: 'adamw'
+      optax_args: []
+      optax_kwargs:
+        learning_rate: 1.0
+        b1: 0.9
+        b2: 0.99
+        weight_decay: 0.0001
+      ol_init: 'cb_stable_init'
+      ol_update_fn: 'cb_stable_update'
+      ol_args: []
+      ol_kwargs:
+        eps: 1e-3 #1e-8
+        eta: 1.0
+        decay: 0.9999
+        stability: 0.0
+        grad_stab: 2.0
+      lower_bound: 0.0 #0.0 # 1e-3
+      upper_bound: 1e-2 #10.0
+      use_loss_diff: true
+      rand_scaling_type: none
+      clip: 0.1
+      clip_ol: 200
+
       
 
   wd: 0.0001
