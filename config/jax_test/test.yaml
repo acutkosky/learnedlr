@@ -1,5 +1,5 @@
 model:
-  embedding_dim: 300 #768
+  embedding_dim: 768
   n_layers: 12
   n_heads: 4
   context_length: 10
@@ -14,7 +14,7 @@ train:
 
   custom_opt:
 
-    name: 'optax_learned_lr'
+    name: 'optax_rand_scaled'
     ogd:
       lr: 0.01
     
@@ -57,15 +57,26 @@ train:
         decay: 1.0
 
     ol_momentum:
-      ol_init: 'cb_init'
-      ol_update_fn: 'cb_update'
-      ol_reset_fn: 'cb_reset'
+      ol_init: 'cb_stable_init'
+      ol_update_fn: 'cb_stable_update'
+      ol_reset_fn: 'cb_stable_reset'
       ol_args: []
       ol_kwargs:
         eps: 1e-4
         eta: 2.219
         decay: 0.999
-      reset_threshold: 0.1
+      reset_threshold: 100.0
+
+
+    ol_momentum_2:
+      ol_init: 'adagrad_init'
+      ol_update_fn: 'adagrad_update'
+      ol_reset_fn: 'adagrad_reset'
+      ol_args: []
+      ol_kwargs:
+        lr: 1e-4
+        decay: 0.9
+      reset_threshold: 100.0
 
 
 
@@ -100,13 +111,26 @@ train:
       
 
 
+    optax_rand_scaled:
+      optax_optimizer: 'adamw'
+      optax_args: []
+      optax_kwargs:
+        learning_rate: 1.0
+        b1: 0.9
+        b2: 0.99
+        weight_decay: 0.0001
+      use_loss_diff: true
+      rand_scaling_type: none
+      clip: 1000.0
+      
+
   wd: 0.0001
   clip: 0.01
 
   # generic options useful for all training algorithms
   warmup_examples: 204800 # how many examples of linear warmup to perform
   total_examples: 12288000
-  lr: 0.0 #0.001 #0.001 # learning rate
+  lr: 0.001 #0.001 #0.001 # learning rate
   beta1: 0.9 #beta values for adam algorithms
   beta2: 0.99
 

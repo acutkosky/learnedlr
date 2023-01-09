@@ -23,6 +23,7 @@ import optax
 from functools import partial
 
 import opt_jax
+import rand_scaling_opts
 
 from typing import Any
 from jax import numpy as jnp
@@ -159,6 +160,18 @@ class Trainer:
                     reset_threshold=opt_conf.reset_threshold,
                 )
 
+            if self.config.custom_opt.name == 'ol_momentum_2':
+                opt_conf = config.custom_opt.ol_momentum_2
+                self.optimizer_state, self.optimizer_step = rand_scaling_opts.OL_momentum_init(
+                    model_state['params'],
+                    ol_init=getattr(rand_scaling_opts, opt_conf.ol_init),
+                    ol_args=to_container(opt_conf.ol_args),
+                    ol_kwargs=to_container(opt_conf.ol_kwargs),
+                    ol_update_fn=getattr(rand_scaling_opts, opt_conf.ol_update_fn),
+                    ol_reset_fn=getattr(rand_scaling_opts, opt_conf.ol_reset_fn),
+                    reset_threshold=opt_conf.reset_threshold,
+                )
+
             if self.config.custom_opt.name == 'optax_learned_lr':
                 opt_conf = config.custom_opt.optax_learned_lr
                 
@@ -182,6 +195,19 @@ class Trainer:
                     per_variable_lr=opt_conf.per_variable_lr,
                     additive_bounds=opt_conf.additive_bounds,
                 )
+            if self.config.custom_opt.name == 'optax_rand_scaled':
+                opt_conf = config.custom_opt.optax_rand_scaled
+
+                self.optimizer_state, self.optimizer_step = rand_scaling_opts.optax_rand_scaled_init(
+                    model_state['params'],
+                    optax_optimizer=getattr(optax, opt_conf.optax_optimizer),
+                    optax_args=to_container(opt_conf.optax_args),
+                    optax_kwargs=to_container(opt_conf.optax_kwargs),
+                    clip=opt_conf.clip,
+                    rand_scaling_type=opt_conf.rand_scaling_type,
+                    use_loss_diff=opt_conf.use_loss_diff
+                )
+                
 
 
         # self.losses = []
