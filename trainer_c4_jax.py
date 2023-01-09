@@ -179,6 +179,7 @@ class Trainer:
                     clip=opt_conf.clip,
                     clip_meta_grad=opt_conf.clip_meta_grad,
                     multiply=opt_conf.multiply,
+                    per_variable_lr=opt_conf.per_variable_lr,
                     additive_bounds=opt_conf.additive_bounds,
                 )
 

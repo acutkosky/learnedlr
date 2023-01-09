@@ -1,18 +1,20 @@
 model:
-  embedding_dim: 768
+  embedding_dim: 300 #768
   n_layers: 12
-  n_heads: 12
-  context_length: 20
+  n_heads: 4
+  context_length: 10
   use_diag: False
   use_fc: True
 train:
   framework: 'pytorch'
   optimizer: custom # current options: adamw, pertensor_randomol
 
+  context_length: 10
+
 
   custom_opt:
 
-    name: 'adamw_learned_lr'
+    name: 'optax_learned_lr'
     ogd:
       lr: 0.01
     
@@ -21,6 +23,27 @@ train:
       eta: 2.219 #(2/(2 - log(3)))
       decay: 0.99
 
+
+    optax_learned_lr_ada:
+      optax_optimizer: 'adamw'
+      optax_args: []
+      optax_kwargs:
+        learning_rate: 1.0
+        b1: 0.9
+        b2: 0.99
+        weight_decay: 0.0001
+      ol_init: 'adagrad_init'
+      ol_update_fn: 'adagrad_update'
+      ol_args: []
+      ol_kwargs:
+        eps: 1e-8
+        lr: 0.0001
+        decay: 0.999
+      lower_bound: 1e-3
+      upper_bound: 100.0
+      multiply: true
+      additive_bounds: false
+      clip: 0.01
 
     adamw_learned_lr:
       beta1: 0.9
@@ -31,14 +54,59 @@ train:
       cb:
         eps: 1e-5
         eta: 2.219
-        decay: 0.99
+        decay: 1.0
+
+    ol_momentum:
+      ol_init: 'cb_init'
+      ol_update_fn: 'cb_update'
+      ol_reset_fn: 'cb_reset'
+      ol_args: []
+      ol_kwargs:
+        eps: 1e-4
+        eta: 2.219
+        decay: 0.999
+      reset_threshold: 0.1
+
+
+
+
+    optax_learned_lr:
+      optax_optimizer: 'adamw'
+      optax_args: []
+      optax_kwargs:
+        learning_rate: 1.0
+        b1: 0.9
+        b2: 0.99
+        weight_decay: 0.0001
+      ol_init: 'cb_stable_init'
+      ol_update_fn: 'cb_stable_update'
+      ol_args: []
+      ol_kwargs:
+        eps: 1e-3 #1e-8
+        eta: 1.0
+        decay: 0.9999
+        stability: 0.0
+        grad_stab: 2.0
+      lower_bound: 0.0 #0.0 # 1e-3
+      upper_bound: 1e-2 #10.0
+      steps_per_ol_update: 1 #25
+      multiply: false
+      additive_bounds: true
+      use_loss_diff: false
+      use_rand_scaling: true
+      per_variable_lr: true
+      clip: 0.1
+      clip_meta_grad: 200.0
+      
+
 
   wd: 0.0001
+  clip: 0.01
 
   # generic options useful for all training algorithms
-  warmup_examples: 0 #1024000 # how many examples of linear warmup to perform
+  warmup_examples: 204800 # how many examples of linear warmup to perform
   total_examples: 12288000
-  lr: 0.0001 # learning rate
+  lr: 0.0 #0.001 #0.001 # learning rate
   beta1: 0.9 #beta values for adam algorithms
   beta2: 0.99
 
@@ -46,7 +114,7 @@ train:
   cosine_decay: False
   true_cosine_decay: False
 
-  decay_type: true_cosine
+  decay_type: none # linear
 
   # generic options for the trainer
   num_workers: 3
@@ -58,5 +126,5 @@ train:
   # options for wandb
   log_differences: false
   logging: true
-  wandb_project: C4_adamw_jax_12M
-  log_interval: 10
+  wandb_project: C4_adamw_jax_12M_debug
+  log_interval: 5

@@ -204,15 +204,15 @@ def optax_learned_lr_init(
     state = {
         'optax_state': optax_opt.init(params),
         'prev_update': zeros_like(params),
-        'prev_lr_residual': zeros_like(init_ol_param),
+        'prev_lr_residual': init_ol_param,
         'lower_bound': lower_bound,
         'upper_bound': upper_bound,
-        'prev_scaling': zeros_like(init_ol_param),
+        'prev_scaling': init_ol_param,
         'clip': clip,
         'clip_meta_grad': clip_meta_grad,
         'ol_state':  ol_init(init_ol_param, *ol_args, **ol_kwargs), #ol_state, #ol_init(jnp.zeros(1), *ol_args, **ol_kwargs),
         'steps_per_ol_update': steps_per_ol_update,
-        'ol_grad_accumulator': zeros_like(init_ol_param),
+        'ol_grad_accumulator': init_ol_param,
         'true_params': params,
         'prev_true_params': params,
         'num_ol_steps': 0,
@@ -348,10 +348,11 @@ def optax_learned_lr_update(
             total_dot_product = tree_reduce(
                 lambda ac, x: ac + x,
                 res_grad_current)
-            res_grad_scaling = (loss_diff/(1e-8 + total_dot_product * ol_state['prediction'])) 
+            # res_grad_scaling = (loss_diff/(1e-8 + total_dot_product * ol_state['prediction'])) 
             res_grad_current = tree_map(
-                lambda x: x * res_grad_scaling,
-                res_grad_current
+                lambda x, p: x * loss_diff / (1e-8 + total_dot_product * p),
+                res_grad_current,
+                ol_state['prediction']
             )
         else:
             res_grad_current = (loss_diff/(1e-8 + ol_state['prediction'])) 
@@ -382,6 +383,7 @@ def optax_learned_lr_update(
         lambda x: x * jnp.minimum(1.0, clip_meta_grad/(1e-8 + jnp.linalg.norm(x))),
         res_grad
     )
+    # res_grad = jnp.minimum(1.0, clip_meta_grad/(1e-8 + jnp.linalg.norm(res_grad)))
 
 
     cur_rng, rng  = jax.random.split(rng)
@@ -399,14 +401,33 @@ def optax_learned_lr_update(
     # this modifies the residual gradient to correctly preserve regret bounds
     # over clipping (note that simply differentiating through the clipping operation
     # does NOT preserve regret as it would zero-out the gradient whenever clipping occurs).
-    res_grad = tree_map(
-        lambda ol_p, prev_res, r_g: jnp.where(
-            -(ol_p - prev_res) * jnp.sign(r_g) > 1e-8, # should be == 0 when no clipping happens, but idk about floating point stuff.
-            jnp.zeros_like(r_g),
-            r_g),
-        ol_prediction,
-        prev_lr_residual,
-        res_grad)
+    if per_variable_lr:
+        res_grad = tree_map(
+            lambda ol_p, prev_res, r_g: jnp.where(
+                -(ol_p - prev_res) * jnp.sign(r_g) > 1e-8, # should be == 0 when no clipping happens, but idk about floating point stuff.
+                jnp.zeros_like(r_g),
+                r_g),
+            ol_prediction,
+            prev_lr_residual,
+            res_grad)
+
+    else:
+        print("ol_p: ",ol_prediction)
+        print("prev_res: ",prev_lr_residual)
+        res_grad = jnp.where(
+                -(ol_prediction - prev_lr_residual) * jnp.sign(res_grad) > 1e-8, # should be == 0 when no clipping happens, but idk about floating point stuff.
+                jnp.zeros_like(res_grad),
+                res_grad)
+    
+    
+    # res_grad = tree_map(
+    #     lambda ol_p, prev_res, r_g: jnp.where(
+    #         -(ol_p - prev_res) * jnp.sign(r_g) > 1e-8, # should be == 0 when no clipping happens, but idk about floating point stuff.
+    #         jnp.zeros_like(r_g),
+    #         r_g),
+    #     ol_prediction,
+    #     prev_lr_residual,
+    #     res_grad)
 
 
     # perform online learning update on residual. The residual will be the "prediction" of the online learner.
@@ -422,62 +443,101 @@ def optax_learned_lr_update(
     num_ol_steps_next = (num_ol_steps_next < steps_per_ol_update) * num_ol_steps_next
 
     if multiply:
+        # residual = jnp.clip(ol_prediction_next, a_min=jnp.log(lower_bound), a_max=jnp.log(upper_bound))
         residual = tree_map(
             lambda o: jnp.clip(o, a_min=jnp.log(lower_bound), a_max=jnp.log(upper_bound)),
             ol_prediction_next)
     else:
         if additive_bounds:
+            # residual = jnp.clip(ol_prediction_next, a_min=lower_bound, a_max=upper_bound)
             residual = tree_map(
                 lambda o: jnp.clip(o, a_min=lower_bound, a_max=upper_bound),
                 ol_prediction_next)
         else:
+            # residual = jnp.clip(ol_prediction_next, a_min=lower_bound*lr - lr, a_max=upper_bound*lr - lr)
             residual = tree_map(
                 lambda o: jnp.clip(o, a_min=lower_bound*lr - lr, a_max=upper_bound*lr - lr),
                 ol_prediction_next)
-    
 
     update, optax_state_next = optax_opt.update(grad,  optax_state, params)
 
+    # residual = broadcast(residual, update)
 
-    if multiply:
-        learned_lr = tree_map(
-            lambda r: lr * jnp.exp(rand_scaling * r),
-            residual)
+    if per_variable_lr:
+        if multiply:
+            learned_lr = tree_map(
+                lambda r: lr * jnp.exp(rand_scaling * r),
+                residual)
 
-        true_params_next = tree_map(
-            lambda p, u, r: p + lr * jnp.exp(r) * u,
-            true_params,
-            update,
-            residual
-        )
+            true_params_next = tree_map(
+                lambda p, u, r: p + lr * jnp.exp(r) * u,
+                true_params,
+                update,
+                residual
+            )
 
-        update = tree_map(
-            lambda u, r: lr * jnp.exp(rand_scaling * r) * u,
-            update,
-            residual)
-        # multiply e^residual by lr
-        param_next = tree_map(
-            lambda p, u: p + u,
-            params,
-            update)
+            update = tree_map(
+                lambda u, r: lr * jnp.exp(rand_scaling * r) * u,
+                update,
+                residual)
+            # multiply e^residual by lr
+            param_next = tree_map(
+                lambda p, u: p + u,
+                params,
+                update)
 
 
+        else:
+            true_params_next = tree_map(
+                lambda p, u, r: p + (lr + r) * u,
+                true_params,
+                update,
+                residual
+            )
+            learned_lr = tree_map(
+                lambda r: lr + rand_scaling * r,
+                residual
+            )
+            # add mode: add residual with random scaling to the lr
+            param_next = tree_map(
+                lambda p, u, l: p + l * u,
+                true_params,
+                update,
+                learned_lr)
     else:
-        true_params_next = tree_map(
-            lambda p, u, r: p + (lr + r) * u,
-            true_params,
-            update,
-            r
-        )
-        learned_lr = tree_map(
-            lambda r: lr + rand_scaling * r,
-            residual
-        )
-        # add mode: add residual with random scaling to the lr
-        param_next = tree_map(
-            lambda p, u: p + learned_lr * u,
-            true_params,
-            update)
+        if multiply:
+            learned_lr = lr * jnp.exp(rand_scaling * residual)
+
+            true_params_next = tree_map(
+                lambda p, u, r: p + lr * jnp.exp(residual) * u,
+                true_params,
+                update
+            )
+
+            update = tree_map(
+                lambda u, r: lr * jnp.exp(rand_scaling * residual) * u,
+                update)
+            # multiply e^residual by lr
+            param_next = tree_map(
+                lambda p, u: p + u,
+                params,
+                update)
+
+
+        else:
+            true_params_next = tree_map(
+                lambda p, u: p + (lr + residual) * u,
+                true_params,
+                update
+            )
+            learned_lr = lr + rand_scaling * residual
+
+            # add mode: add residual with random scaling to the lr
+            param_next = tree_map(
+                lambda p, u: p + learned_lr * u,
+                true_params,
+                update)
+        
 
 
 
@@ -508,11 +568,11 @@ def optax_learned_lr_update(
 
     if do_logging:
         log_dict = {
-            'learned_lr': tree_average(learned_lr),
+            'learned_lr': learned_lr,
             # 'expected_learned_lr': lr + 0.5*residual,
-            'ol_prediction': tree_average(ol_state_next['prediction']),
-            'residual': tree_average(residual),
-            'grad_accumulator': tree_average(ol_grad_accumulator_next),
+            'ol_prediction': ol_state_next['prediction'],
+            'residual': residual,
+            'grad_accumulator': ol_grad_accumulator_next,
             'loss_accumulator': loss_accumulator_next,
         }
         log_dict.update(ol_logs)
