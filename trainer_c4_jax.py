@@ -173,7 +173,11 @@ class Trainer:
                     ol_update_fn=getattr(opt_jax, opt_conf.ol_update_fn),
                     lower_bound=opt_conf.lower_bound,
                     upper_bound=opt_conf.upper_bound,
+                    use_loss_diff=opt_conf.use_loss_diff,
+                    use_rand_scaling=opt_conf.use_rand_scaling,
+                    steps_per_ol_update=opt_conf.steps_per_ol_update,
                     clip=opt_conf.clip,
+                    clip_meta_grad=opt_conf.clip_meta_grad,
                     multiply=opt_conf.multiply,
                     additive_bounds=opt_conf.additive_bounds,
                 )
