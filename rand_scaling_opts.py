@@ -575,9 +575,13 @@ def optax_ol_scaled_init(
             can be 'none' (just regular adamw), 'uniform' (uniform in [0,1]),
             or 'exponential' (from an exponential distribution with mean 1),
             or 'half': scale by 0.5
+            Note that 'none' is the string 'none', not the python value None.
 
         use_loss_diff: if true, we will rescale the gradient so that
             <gradient , update> = loss(param + update) - loss(param)
+            
+            **** NOTE: if you set use_loss_diff=true, you probably want to set
+            rand_scaling_type = 'none'
 
 
     returns:
@@ -628,6 +632,7 @@ def optax_ol_scaled_update(
             or 'half': scale by 0.5
         use_loss_diff: if true, we will rescale the gradient so that
             <gradient , update> = loss(param + update) - loss(param)
+
         ol_update: update function for online learner
         optax_opt: optax optimizer object.
             *** these first arguments will be set by optax_rand_scaled_init via a partial because they cannot be jitted.
