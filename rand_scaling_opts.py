@@ -850,19 +850,19 @@ def cb_stable_update(grad, opt_state, do_logging=False):
     subepoch_count_next = tree_map(lambda c, m: c + m, subepoch_count, end_subepoch_mask)
 
     subepoch_grad_abs_sum_next = tree_map(
-        lambda s, m, g: s * decay + m * jnp.abs(g),
+        lambda s, mk, g: s * decay + mk * jnp.abs(g),
         subepoch_grad_abs_sum,
         end_subepoch_mask,
         subepoch_grad_next)
 
     subepoch_grad_sum_next = tree_map(
-        lambda s, m, g: s*decay + m * g,
+        lambda s, mk, g: s*decay + mk * g,
         subepoch_grad_sum,
         end_subepoch_mask,
         subepoch_grad_next)
 
     bet_fractions_next = tree_map(
-        lambda s, d, t, m, b, mask, : jnp.where(mask, -eta * s/(1e-8 + 2 * (m+t) * (t+m + d)), b),
+        lambda s, d, t, mx, b, mk, : jnp.where(mk, -eta * s/(1e-8 + 2 * (mx+t) * (t+mx + d)), b),
         subepoch_grad_sum_next,
         subepoch_grad_abs_sum_next,
         current_stab,
