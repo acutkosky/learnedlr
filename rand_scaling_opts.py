@@ -53,6 +53,271 @@ def tree_dot(a, b):
 
 
 
+#### ONLINE LEARNERS ####
+#### Each has three functions:
+#### _init takes the parameters and some hyperparams and returns the online learner state
+#### _reset resets the state (basically like calling init but without the parameters).
+#### _update takes a gradient and the state and computes the new state.
+####     state['prediction'] contains the current parameters predicted by the online learner.
+#### CB_STABLE IS THE MOST ADVANCED ONE
+
+def ogd_init(params, lr=1.0, eps=1e-8, decay=1.0):
+    state = {
+        'prediction': zeros_like(params),
+        'decay': decay,
+        'eps': eps,
+        'lr': lr,
+    }
+
+    return state
+
+def ogd_reset(old_state, epoch_count):
+    state = {
+        'prediction': zeros_like(old_state['prediction']),
+        'decay': old_state['decay'],
+        'lr': old_state['lr']/(epoch_count + 1.0),
+    }
+
+    return state    
+
+def ogd_update(grad, opt_state, do_logging=False):
+
+    prediction = opt_state['prediction']
+    decay = opt_state['decay']
+    lr = opt_state['lr']
+
+    prediction_next = tree_map(
+        lambda p, g: p * decay - lr * g,
+        prediction,
+        grad,
+    )
+
+    opt_state_next = {
+        'prediction': prediction_next,
+        'decay': decay,
+        'lr': lr,
+    }
+
+    return opt_state_next, {}
+
+
+
+
+def adagrad_init(params, lr=1.0, eps=1e-8, decay=1.0):
+    state = {
+        'grad_squared_sum': zeros_like(params),
+        'prediction': zeros_like(params),
+        'decay': decay,
+        'eps': eps,
+        'lr': lr,
+    }
+
+    return state
+
+def adagrad_reset(old_state, epoch_count):
+    state = {
+        'grad_squared_sum': zeros_like(old_state['grad_squared_sum']),
+        'prediction': zeros_like(old_state['prediction']),
+        'decay': old_state['decay'],
+        'eps': old_state['eps'],
+        'lr': old_state['lr']/(epoch_count + 1.0),
+    }
+
+    return state    
+
+def adagrad_update(grad, opt_state, do_logging=False):
+
+    grad_squared_sum = opt_state['grad_squared_sum']
+    prediction = opt_state['prediction']
+    decay = opt_state['decay']
+    eps = opt_state['eps']
+    lr = opt_state['lr']
+
+    grad_squared_sum_next = tree_map(
+        lambda s, g: s * decay + g**2,
+        grad_squared_sum,
+        grad
+    )
+
+    prediction_next = tree_map(
+        lambda p, g, s: p * decay - lr * g / (eps + jnp.sqrt(s)),
+        prediction,
+        grad,
+        grad_squared_sum
+    )
+
+    opt_state_next = {
+        'grad_squared_sum': grad_squared_sum_next,
+        'prediction': prediction_next,
+        'decay': decay,
+        'eps': eps,
+        'lr': lr,
+    }
+
+    return opt_state_next, {}
+
+
+
+
+def cb_stable_init(params, eps=1e-2, eta=1.0, decay=0.999, stability=0.0, grad_stab=2.0):
+    state = {
+        'wealth': tree_map(lambda x: jnp.full_like(x, fill_value=eps), params), #zeros_like(params),
+        'bet_fractions': zeros_like(params),
+        'subepoch_grad': zeros_like(params),
+        'max_grads': zeros_like(params),
+        'subepoch_grad_abs_sum': zeros_like(params),
+        'subepoch_grad_sum': zeros_like(params),
+        'eps': eps,
+        'decay': decay,
+        'stability': stability,
+        'grad_stab': grad_stab,
+        'eta': eta,
+        'prediction': zeros_like(params),
+        'subepoch_count': zeros_like(params),
+    }
+
+    return state
+
+
+def cb_stable_reset(old_state, count):
+    state = {
+        'wealth': tree_map( lambda x: jnp.full_like(x, fill_value=old_state['eps']/(count+1)), old_state['wealth']),
+        'bet_fractions': zeros_like(old_state['bet_fractions']),
+        'subepoch_grad': zeros_like(old_state['subepoch_grad']),
+        'max_grads': old_state['max_grads'],
+        'subepoch_grad_abs_sum': zeros_like(old_state['subepoch_grad_abs_sum']),
+        'subepoch_grad_sum': zeros_like(old_state['subepoch_grad_sum']),
+        'eta': old_state['eta'],
+        'eps': old_state['eps']/(count + 1),
+        'decay': old_state['decay'],
+        'stability': old_state['stability'],
+        'grad_stab': old_state['grad_stab'],
+        'prediction': zeros_like(old_state['prediction']),
+        'subepoch_count': zeros_like(old_state['subepoch_count']),
+    }
+    return state
+
+def cb_stable_update(grad, opt_state, do_logging=False):
+    
+    wealth = opt_state['wealth']
+    bet_fractions = opt_state['bet_fractions']
+    subepoch_grad = opt_state['subepoch_grad']
+    max_grads = opt_state['max_grads']
+    eps = opt_state['eps']
+    decay = opt_state['decay']
+    stability = opt_state['stability']
+    grad_stab = opt_state['grad_stab']
+    subepoch_grad_abs_sum = opt_state['subepoch_grad_abs_sum']
+    subepoch_grad_sum = opt_state['subepoch_grad_sum']
+    eta = opt_state['eta']
+    subepoch_count = opt_state['subepoch_count']
+
+
+
+    current_stab = tree_map(lambda m: stability + grad_stab * m, max_grads)
+
+    max_grads_next = tree_map(lambda m, g: jnp.maximum(m * decay, jnp.abs(g)), max_grads, grad)
+
+    grad = tree_map(lambda g, m: jnp.clip(g, a_min=-m, a_max=m), grad, max_grads)
+
+    subepoch_grad_next = tree_map(lambda s, g: s + g, subepoch_grad, grad)
+
+    end_subepoch_mask = tree_map(lambda s, t: jnp.abs(s) > t, subepoch_grad_next, current_stab)
+
+    subepoch_count_next = tree_map(lambda c, m: c + m, subepoch_count, end_subepoch_mask)
+
+    subepoch_grad_abs_sum_next = tree_map(
+        lambda s, mk, g: s * decay + mk * jnp.abs(g),
+        subepoch_grad_abs_sum,
+        end_subepoch_mask,
+        subepoch_grad_next)
+
+    subepoch_grad_sum_next = tree_map(
+        lambda s, mk, g: s*decay + mk * g,
+        subepoch_grad_sum,
+        end_subepoch_mask,
+        subepoch_grad_next)
+
+    bet_fractions_next = tree_map(
+        lambda s, gs, t, mx, : -eta * s/(1e-8 + 2 * (mx+t) * (t+mx + gs)),
+        subepoch_grad_sum_next,
+        subepoch_grad_abs_sum_next,
+        current_stab,
+        max_grads_next,
+    )
+
+    wealth_next = tree_map(
+        lambda w, b, g, mk, bn, s: w * ( (decay - b*(g * mk+ jnp.sign(g * mk) * s))/(1.0 - s * jnp.sign(g * mk) * bn)),
+        wealth,
+        bet_fractions,
+        subepoch_grad_next,
+        end_subepoch_mask,
+        bet_fractions_next,
+        current_stab,
+    )
+
+    prediction = tree_map(
+        lambda w, b: w*b,
+        wealth_next,
+        bet_fractions_next,
+    )
+
+
+
+    subepoch_grad_next = tree_map(
+        lambda s, m: s * jnp.logical_not(m),
+        subepoch_grad_next,
+        end_subepoch_mask
+    )
+
+    state = {
+        'wealth': wealth_next,
+        'bet_fractions': bet_fractions_next,
+        'subepoch_grad': subepoch_grad_next,
+        'subepoch_grad_sum': subepoch_grad_sum_next,
+        'max_grads': max_grads_next,
+        'subepoch_grad_abs_sum': subepoch_grad_abs_sum_next,
+        'eps': eps,
+        'decay': decay,
+        'stability': stability,
+        'grad_stab': grad_stab,
+        'eta': eta,
+        'prediction': prediction,
+        'subepoch_count': subepoch_count_next,
+    }
+
+    return state, {
+        'wealth': tree_map(lambda x: jnp.average(x), wealth_next),
+        'bet_fractions': tree_map(lambda x: jnp.average(x), bet_fractions_next),
+        'max_grad': tree_map(lambda x: jnp.average(x), max_grads_next),
+        'subepoch_grad_sum': tree_map(lambda x: jnp.average(x), subepoch_grad_sum_next),
+        'subepoch_grad': tree_map(lambda x: jnp.average(x), subepoch_grad_next),
+        'subepoch_count': tree_map(lambda x: jnp.average(x), subepoch_count_next),
+        }
+
+
+
+
+########## END ONLINE LEARNERS ###############
+
+
+
+
+
+
+
+########## Optax optimizer learning rate learners
+### these have two functions:
+### _init takes params and hyperparameters and returns a state and an update function.
+###    the update function has a long signature. Take a look at
+### _update to see what it is. _init will take care of automatically supplying some of the
+### arguments to the update function via a partial. **you probably never want to directly call
+###  _update - instead use the function returned by _init.
+
+### there are two optimizers, first simply scales the lr of an optax optimizer by a random quantity.
+### second (optax_ol_scaled) uses an online learner to choose the lr.
+
+
 def optax_rand_scaled_init(
     params,
     optax_optimizer,
@@ -173,52 +438,21 @@ def optax_rand_scaled_update(
     value, grad = loss_and_grad_fn(model_and_example_state)
 
 
-    # true_params =  tree_map(
-    #     lambda x, u: x  + (prev_true_update_scaling - prev_rand_update_scaling) * u,
-    #     params,
-    #     prev_update
-    # )
-
 
 
     if use_loss_diff:
-        # example_state = model_and_example_state.copy()
-        # example_state.pop('model_state')
-
-        # true_model_state = {
-        #     'constants': constants,
-        #     'params': true_params,
-
-        # }
-        # true_model_and_example_state = model_and_example_state
         model_and_example_state['model_state']['params'] = true_params
-
-        # model_and_example_state.update(example_state)
 
         true_loss, _ = loss_and_grad_fn(model_and_example_state)
 
-        # prev_true_params = tree_map(
-        #     lambda x, u: x  - prev_rand_update_scaling * u,
-        #     params,
-        #     prev_update
-        # )
 
         model_and_example_state['model_state']['params'] = prev_true_params
 
-        # prev_true_model_state = {
-        #     'constants': constants,
-        #     'params': prev_true_params,
-        # }
-        # prev_true_model_and_example_state = {
-        #     'model_state': prev_true_model_state,
-        # }
-        # prev_true_model_and_example_state.update(example_state)
 
         prev_true_loss, _ = loss_and_grad_fn(model_and_example_state)
 
         loss_diff = true_loss['loss'] - prev_true_loss['loss']
 
-        # rescale grad so that <grad, update> = loss_diff
         grad_update_product = tree_dot(grad, prev_update)
         grad = tree_map(
             lambda g: g * (1e-5 + jnp.abs(loss_diff)) / (1e-8 + jnp.abs(grad_update_product)),
@@ -304,14 +538,14 @@ def optax_ol_scaled_init(
     optax_optimizer,
     optax_args,
     optax_kwargs,
-    ol_update_fn,
-    ol_init,
-    ol_args,
-    ol_kwargs,
-    clip=1.0,
-    clip_ol=1.0,
-    lower_bound=0.0,
-    upper_bound=1.0,
+    ol_update_fn=cb_stable_update,
+    ol_init=cb_stable_init,
+    ol_args=[],
+    ol_kwargs={},
+    clip=0.1,
+    clip_ol=200.0,
+    lower_bound=1e-8,
+    upper_bound=1e-2,
     rand_scaling_type='uniform',
     use_loss_diff=False,
     **_kwargs):
@@ -569,7 +803,11 @@ def optax_ol_scaled_update(
 
 
 
-
+########## OL momentum based optimizers
+#### these implement more precisely the theory-oriented algorithm
+#### currently using with cb_stable uses a ton of slots.
+#### I strongly suspect there is a more efficient implementation of cb_stable
+#### that doesn't use as many slots.
 
 
 
@@ -680,246 +918,4 @@ def OL_momentum_update(ol_update, ol_reset, loss_and_grad_fn, rng, model_and_exa
    
 
 
-
-
-
-
-def ogd_init(params, lr=1.0, eps=1e-8, decay=1.0):
-    state = {
-        'prediction': zeros_like(params),
-        'decay': decay,
-        'eps': eps,
-        'lr': lr,
-    }
-
-    return state
-
-def ogd_reset(old_state, epoch_count):
-    state = {
-        'prediction': zeros_like(old_state['prediction']),
-        'decay': old_state['decay'],
-        'lr': old_state['lr']/(epoch_count + 1.0),
-    }
-
-    return state    
-
-def ogd_update(grad, opt_state, do_logging=False):
-
-    prediction = opt_state['prediction']
-    decay = opt_state['decay']
-    lr = opt_state['lr']
-
-    prediction_next = tree_map(
-        lambda p, g: p * decay - lr * g,
-        prediction,
-        grad,
-    )
-
-    opt_state_next = {
-        'prediction': prediction_next,
-        'decay': decay,
-        'lr': lr,
-    }
-
-    return opt_state_next, {}
-
-
-
-
-def adagrad_init(params, lr=1.0, eps=1e-8, decay=1.0):
-    state = {
-        'grad_squared_sum': zeros_like(params),
-        'prediction': zeros_like(params),
-        'decay': decay,
-        'eps': eps,
-        'lr': lr,
-    }
-
-    return state
-
-def adagrad_reset(old_state, epoch_count):
-    state = {
-        'grad_squared_sum': zeros_like(old_state['grad_squared_sum']),
-        'prediction': zeros_like(old_state['prediction']),
-        'decay': old_state['decay'],
-        'eps': old_state['eps'],
-        'lr': old_state['lr']/(epoch_count + 1.0),
-    }
-
-    return state    
-
-def adagrad_update(grad, opt_state, do_logging=False):
-
-    grad_squared_sum = opt_state['grad_squared_sum']
-    prediction = opt_state['prediction']
-    decay = opt_state['decay']
-    eps = opt_state['eps']
-    lr = opt_state['lr']
-
-    grad_squared_sum_next = tree_map(
-        lambda s, g: s * decay + g**2,
-        grad_squared_sum,
-        grad
-    )
-
-    prediction_next = tree_map(
-        lambda p, g, s: p * decay - lr * g / (eps + jnp.sqrt(s)),
-        prediction,
-        grad,
-        grad_squared_sum
-    )
-
-    opt_state_next = {
-        'grad_squared_sum': grad_squared_sum_next,
-        'prediction': prediction_next,
-        'decay': decay,
-        'eps': eps,
-        'lr': lr,
-    }
-
-    return opt_state_next, {}
-
-
-
-
-def cb_stable_init(params, eps=1.0, eta=1.0, decay=1.0, stability=0.0, grad_stab=0.0):
-    state = {
-        'wealth': tree_map(lambda x: jnp.full_like(x, fill_value=eps), params), #zeros_like(params),
-        'bet_fractions': zeros_like(params),
-        'subepoch_grad': zeros_like(params),
-        'max_grads': zeros_like(params),
-        'subepoch_grad_abs_sum': zeros_like(params),
-        'subepoch_grad_sum': zeros_like(params),
-        'eps': eps,
-        'decay': decay,
-        'stability': stability,
-        'grad_stab': grad_stab,
-        'eta': eta,
-        'prediction': zeros_like(params),
-        'subepoch_count': zeros_like(params),
-    }
-
-    return state
-
-
-def cb_stable_reset(old_state, count):
-    state = {
-        'wealth': tree_map( lambda x: jnp.full_like(x, fill_value=old_state['eps']/(count+1)), old_state['wealth']),
-        'bet_fractions': zeros_like(old_state['bet_fractions']),
-        'subepoch_grad': zeros_like(old_state['subepoch_grad']),
-        'max_grads': old_state['max_grads'],
-        'subepoch_grad_abs_sum': zeros_like(old_state['subepoch_grad_abs_sum']),
-        'subepoch_grad_sum': zeros_like(old_state['subepoch_grad_sum']),
-        'eta': old_state['eta'],
-        'eps': old_state['eps']/(count + 1),
-        'decay': old_state['decay'],
-        'stability': old_state['stability'],
-        'grad_stab': old_state['grad_stab'],
-        'prediction': zeros_like(old_state['prediction']),
-        'subepoch_count': zeros_like(old_state['subepoch_count']),
-    }
-    return state
-
-def cb_stable_update(grad, opt_state, do_logging=False):
-    
-    wealth = opt_state['wealth']
-    bet_fractions = opt_state['bet_fractions']
-    subepoch_grad = opt_state['subepoch_grad']
-    max_grads = opt_state['max_grads']
-    eps = opt_state['eps']
-    decay = opt_state['decay']
-    stability = opt_state['stability']
-    grad_stab = opt_state['grad_stab']
-    subepoch_grad_abs_sum = opt_state['subepoch_grad_abs_sum']
-    subepoch_grad_sum = opt_state['subepoch_grad_sum']
-    eta = opt_state['eta']
-    subepoch_count = opt_state['subepoch_count']
-
-
-
-    current_stab = tree_map(lambda m: stability + grad_stab * m, max_grads)
-
-    max_grads_next = tree_map(lambda m, g: jnp.maximum(m * decay, jnp.abs(g)), max_grads, grad)
-
-    grad = tree_map(lambda g, m: jnp.clip(g, a_min=-m, a_max=m), grad, max_grads)
-
-    subepoch_grad_next = tree_map(lambda s, g: s + g, subepoch_grad, grad)
-
-    end_subepoch_mask = tree_map(lambda s, t: jnp.abs(s) > t, subepoch_grad_next, current_stab)
-
-    subepoch_count_next = tree_map(lambda c, m: c + m, subepoch_count, end_subepoch_mask)
-
-    subepoch_grad_abs_sum_next = tree_map(
-        lambda s, mk, g: s * decay + mk * jnp.abs(g),
-        subepoch_grad_abs_sum,
-        end_subepoch_mask,
-        subepoch_grad_next)
-
-    subepoch_grad_sum_next = tree_map(
-        lambda s, mk, g: s*decay + mk * g,
-        subepoch_grad_sum,
-        end_subepoch_mask,
-        subepoch_grad_next)
-
-    bet_fractions_next = tree_map(
-        lambda s, d, t, mx, b, mk, : jnp.where(mk, -eta * s/(1e-8 + 2 * (mx+t) * (t+mx + d)), b),
-        subepoch_grad_sum_next,
-        subepoch_grad_abs_sum_next,
-        current_stab,
-        max_grads_next,
-        bet_fractions,
-        end_subepoch_mask,
-    )
-
-    wealth_next = tree_map(
-        lambda w, b, g, m, bn, s: jnp.where(
-            m,
-            w * ( (decay - b*(g+ jnp.sign(g) * s))/(1.0 - s * jnp.sign(g) * bn)),
-            w),
-        wealth,
-        bet_fractions,
-        subepoch_grad_next,
-        end_subepoch_mask,
-        bet_fractions_next,
-        current_stab,
-    )
-
-    prediction = tree_map(
-        lambda w, b: w*b,
-        wealth_next,
-        bet_fractions_next,
-    )
-
-
-
-    subepoch_grad_next = tree_map(
-        lambda s, m: s * jnp.logical_not(m),
-        subepoch_grad_next,
-        end_subepoch_mask
-    )
-
-    state = {
-        'wealth': wealth_next,
-        'bet_fractions': bet_fractions_next,
-        'subepoch_grad': subepoch_grad_next,
-        'subepoch_grad_sum': subepoch_grad_sum_next,
-        'max_grads': max_grads_next,
-        'subepoch_grad_abs_sum': subepoch_grad_abs_sum_next,
-        'eps': eps,
-        'decay': decay,
-        'stability': stability,
-        'grad_stab': grad_stab,
-        'eta': eta,
-        'prediction': prediction,
-        'subepoch_count': subepoch_count_next,
-    }
-
-    return state, {
-        'wealth': tree_map(lambda x: jnp.average(x), wealth_next),
-        'bet_fractions': tree_map(lambda x: jnp.average(x), bet_fractions_next),
-        'max_grad': tree_map(lambda x: jnp.average(x), max_grads_next),
-        'subepoch_grad_sum': tree_map(lambda x: jnp.average(x), subepoch_grad_sum_next),
-        'subepoch_grad': tree_map(lambda x: jnp.average(x), subepoch_grad_next),
-        'subepoch_count': tree_map(lambda x: jnp.average(x), subepoch_count_next),
-        }
 
