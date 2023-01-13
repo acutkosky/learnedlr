@@ -169,7 +169,7 @@ class Trainer:
                     ol_args=to_container(opt_conf.ol_args),
                     ol_kwargs=to_container(opt_conf.ol_kwargs),
                     ol_update_fn=getattr(rand_scaling_opts, opt_conf.ol_update_fn),
-                    ol_reset_fn=getattr(rand_scaling_opts),
+                    ol_reset_fn=getattr(rand_scaling_opts, opt_conf.ol_reset_fn),
                     ol_reset_kwargs=to_container(opt_conf.ol_reset_kwargs),
                     ol_update_kwargs=to_container(opt_conf.ol_update_kwargs),
                     reset_threshold=opt_conf.reset_threshold,
