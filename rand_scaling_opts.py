@@ -71,11 +71,11 @@ def ogd_init(params, lr=1.0, eps=1e-8, decay=1.0):
 
     return state
 
-def ogd_reset(old_state, epoch_count):
+def ogd_reset(old_state, epoch_count, do_decrease=True):
     state = {
         'prediction': zeros_like(old_state['prediction']),
         'decay': old_state['decay'],
-        'lr': old_state['lr']/(epoch_count + 1.0),
+        'lr': old_state['lr']/(epoch_count + 1.0) if do_decrease else old_state['lr'],
     }
 
     return state    
@@ -101,8 +101,6 @@ def ogd_update(grad, opt_state, do_logging=False):
     return opt_state_next, {}
 
 
-
-
 def adagrad_init(params, lr=1.0, eps=1e-8, decay=1.0):
     state = {
         'grad_squared_sum': zeros_like(params),
@@ -114,13 +112,13 @@ def adagrad_init(params, lr=1.0, eps=1e-8, decay=1.0):
 
     return state
 
-def adagrad_reset(old_state, epoch_count):
+def adagrad_reset(old_state, epoch_count, do_decrease=True):
     state = {
         'grad_squared_sum': zeros_like(old_state['grad_squared_sum']),
         'prediction': zeros_like(old_state['prediction']),
         'decay': old_state['decay'],
         'eps': old_state['eps'],
-        'lr': old_state['lr']/(epoch_count + 1.0),
+        'lr': old_state['lr']/(epoch_count + 1.0) if do_decrease else old_state['lr'],
     }
 
     return state    
@@ -159,6 +157,71 @@ def adagrad_update(grad, opt_state, do_logging=False):
 
 
 
+def adagrad_scaled_init(params, lr=1.0, eps=1e-8, decay=1.0, base_lr=1e-5, reg=2.0):
+    state = {
+        'grad_squared_sum': zeros_like(params),
+        'prediction': zeros_like(params),
+        'decay': decay,
+        'eps': eps,
+        'lr': lr,
+        'base_lr': base_lr,
+        'reg': reg
+    }
+
+    return state
+
+def adagrad_scaled_reset(old_state, epoch_count, do_decrease=True):
+    state = {
+        'grad_squared_sum': zeros_like(old_state['grad_squared_sum']),
+        'prediction': zeros_like(old_state['prediction']),
+        'decay': old_state['decay'],
+        'eps': old_state['eps'],
+        'lr': old_state['lr'],
+        'base_lr': old_state['base_lr']/(epoch_count + 1.0) if do_decrease else old_state['base_lr'],
+        'reg': old_state['reg']
+    }
+
+    return state    
+
+def adagrad_scaled_update(grad, opt_state, do_logging=False):
+
+    grad_squared_sum = opt_state['grad_squared_sum']
+    prediction = opt_state['prediction']
+    decay = opt_state['decay']
+    eps = opt_state['eps']
+    lr = opt_state['lr']
+    base_lr = opt_state['base_lr']
+    reg = opt_state['reg']
+
+    grad_squared_sum_next = tree_map(
+        lambda s, g: s * decay + g**2,
+        grad_squared_sum,
+        grad
+    )
+
+    prediction_next = tree_map(
+        lambda p, g, s: p * decay \
+            - lr * (jnp.abs(p) + base_lr) * (g / (eps + jnp.sqrt(s)) + jnp.sign(p) * g**2/(eps + s)),
+        prediction,
+        grad,
+        grad_squared_sum
+    )
+
+    opt_state_next = {
+        'grad_squared_sum': grad_squared_sum_next,
+        'prediction': prediction_next,
+        'decay': decay,
+        'eps': eps,
+        'lr': lr,
+        'base_lr': base_lr,
+        'reg': reg,
+    }
+
+    return opt_state_next, {}
+
+
+
+
 def cb_stable_init(params, eps=1e-2, eta=1.0, decay=0.999, stability=0.0, grad_stab=2.0):
     state = {
         'wealth': tree_map(lambda x: jnp.full_like(x, fill_value=eps), params), #zeros_like(params),
@@ -179,7 +242,7 @@ def cb_stable_init(params, eps=1e-2, eta=1.0, decay=0.999, stability=0.0, grad_s
     return state
 
 
-def cb_stable_reset(old_state, count):
+def cb_stable_reset(old_state, count, do_decrease=True):
     state = {
         'wealth': tree_map( lambda x: jnp.full_like(x, fill_value=old_state['eps']/(count+1)), old_state['wealth']),
         'bet_fractions': zeros_like(old_state['bet_fractions']),
@@ -188,7 +251,7 @@ def cb_stable_reset(old_state, count):
         'subepoch_grad_abs_sum': zeros_like(old_state['subepoch_grad_abs_sum']),
         'subepoch_grad_sum': zeros_like(old_state['subepoch_grad_sum']),
         'eta': old_state['eta'],
-        'eps': old_state['eps']/(count + 1),
+        'eps': old_state['eps']/(count + 1) if do_decrease else old_state['eps'],
         'decay': old_state['decay'],
         'stability': old_state['stability'],
         'grad_stab': old_state['grad_stab'],
@@ -816,28 +879,84 @@ def optax_ol_scaled_update(
 
 
 
-def OL_momentum_init(params, ol_init, ol_args, ol_kwargs, ol_update_fn, ol_reset_fn, reset_threshold=100.0):
+def OL_momentum_init(params,
+                     ol_init,
+                     ol_args,
+                     ol_kwargs,
+                     ol_update_fn,
+                     ol_reset_fn,
+                     ol_reset_kwargs={'do_decrease': False},
+                     ol_update_kwargs={},
+                     reset_threshold=100.0,
+                     rand_scaling_type='uniform'):
+    '''
+    ol_momentum_init: optimization by reduction to online learning
+
+        params: model parameters
+        ol_init: initialization function for online learner
+        ol_args: argument list for ol_init
+        ol_kwargs: keyword argument dictionary for ol_init
+        ol_update_fn: update function for online learner
+        ol_reset_fn: function that resets the state of the online learner
+        ol_reset_kwargs: static kwargs to provide to ol_reset_fn.
+        ol_update_kwargs: static kwargs to provde to ol_update_fn.
+        reset_threshold: reset the online learner when the reward exceeds this
+            value.
+        rand_scaling_type: how to scale the online learner's iterates.
+            should be a string, currently supports:
+            'uniform' and 'half'
+    returns:
+        state: state of the optimizer.
+        update_fn: function to use for applying the optimizer to a model.
+    '''
     state = {
         'ol_state': ol_init(params, *ol_args, **ol_kwargs),
         'true_params': params,
         'last_offset': zeros_like(params),
-        'total_reward': 0.0,
-        'epoch_reward': 0.0,
+        'total_reward': jnp.zeros(1),
+        'epoch_reward': jnp.zeros(1),
         'epoch_count': 0,
         'iteration_count':  0,
         'reset_threshold': reset_threshold,
     }
 
-    return state, functools.partial(OL_momentum_update, ol_update_fn, ol_reset_fn)
+    return state, functools.partial(
+        OL_momentum_update,
+        rand_scaling_type,
+        ol_update_fn,
+        functools.partial(ol_reset_fn, **ol_reset_kwargs),
+        **ol_update_kwargs
+        )
 
-def OL_momentum_update(ol_update, ol_reset, loss_and_grad_fn, rng, model_and_example_state, opt_state, scale=jnp.array(1.0), do_logging=False):
+def OL_momentum_update(rand_scaling_type,
+                       ol_update,
+                       ol_reset,
+                       loss_and_grad_fn,
+                       rng,
+                       model_and_example_state,
+                       opt_state,
+                       scale=jnp.array(1.0),
+                       do_logging=False):
+    '''
+    update function for online learning based optimizer.
+    
+    rand_scaling_type: string, describes how to scale online learner.
+        can be 'uniform' or 'half' or 'none'.
+    ol_update: function for doing the online learning update
+    ol_reset: function for resetting the online learner.
+    '''
 
     value, grad = loss_and_grad_fn(model_and_example_state)
     model_state = model_and_example_state['model_state']
 
     cur_rng, rng = jax.random.split(rng)
 
-    rand_scaling = jax.random.uniform(cur_rng)
+    if rand_scaling_type == 'uniform':
+        rand_scaling = jax.random.uniform(cur_rng)
+    elif rand_scaling_type == 'half':
+        rand_scaling = 0.5
+    elif rand_scaling_type == 'none':
+        rand_scaling = 1.0
  
     constants = model_state['constants']
 
@@ -868,9 +987,9 @@ def OL_momentum_update(ol_update, ol_reset, loss_and_grad_fn, rng, model_and_exa
 
     ol_state, epoch_reward_next, epoch_count_next = jax.lax.cond(
         jnp.all(epoch_reward_next > reset_threshold),
-        lambda s, c: (ol_reset(s, c), jnp.zeros(1), c + 1),
-        lambda s, c: (s, jnp.zeros(1), c),
-        ol_state, epoch_count)
+        lambda s, r, c: (ol_reset(s, c), jnp.zeros_like(r), c + 1),
+        lambda s, r, c: (s, r, c),
+        ol_state, epoch_reward_next, epoch_count)
 
     # apply constraint set reduction for 1-D intervals
     grad = tree_map(
