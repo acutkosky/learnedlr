@@ -13,6 +13,9 @@ def tree_average(tree):
 def zeros_like(tree):
     return tree_map(lambda x: jnp.zeros_like(x), tree)
 
+def ones_like(tree):
+    return tree_map(lambda x: jnp.ones_like(x), tree)
+
 def broadcast(to_broadcast, broadcast_to):
     return tree_map(lambda b, postfix: tree_map(lambda x: b, postfix),
         to_broadcast,
@@ -889,6 +892,7 @@ def OL_momentum_init(params,
                      ol_reset_fn,
                      ol_reset_kwargs={'do_decrease': False},
                      ol_update_kwargs={},
+                     weight_decay=0.0,
                      reset_threshold=100.0,
                      rand_scaling_type='uniform'):
     '''
@@ -923,6 +927,7 @@ def OL_momentum_init(params,
         'iteration_count':  0,
         'reset_threshold': reset_threshold,
         'epoch_start_true_params': params,
+        'weight_decay': weight_decay,
     }
 
     return state, functools.partial(
@@ -975,6 +980,7 @@ def OL_momentum_update(rand_scaling_type,
         rand_scaling = 1.0
  
     constants = model_state['constants']
+    params = model_state['params']
 
     ol_state = opt_state['ol_state']
     true_params = opt_state['true_params']
@@ -987,6 +993,13 @@ def OL_momentum_update(rand_scaling_type,
     epoch_start_true_params = opt_state['epoch_start_true_params']
     bad_epoch_count = opt_state['bad_epoch_count']
     max_epoch_reward = opt_state['max_epoch_reward']
+    weight_decay = opt_state['weight_decay']
+
+    grad = tree_map(
+        lambda g, p: g + weight_decay * p,
+        grad,
+        params
+    )
 
     iteration_count_next = iteration_count + 1
 
@@ -1088,6 +1101,7 @@ def OL_momentum_update(rand_scaling_type,
             'max_epoch_reward': max_epoch_reward_next,
             'update_norm': tree_norm(offset),
             'grad_norm': tree_norm(grad),
+            'max_update_norm': scale * tree_norm(ones_like(offset)),
         }
         log_dict.update(ol_logs)
         # for key, value in ol_logs.items():
