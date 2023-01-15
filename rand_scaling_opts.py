@@ -223,6 +223,67 @@ def simple_fr_update(grad, opt_state, do_logging=False):
     }
 
 
+
+
+def simple_fr_optimistic_init(params, base_lr=1.0, eta=1e-6, decay=1.0):
+    state = {
+        'normal_state': simple_fr_init(params, base_lr, eta, decay),
+        'hint_state': simple_fr_init(params, base_lr, eta, decay),
+        'prediction': zeros_like(params),
+        'hint': zeros_like(params),
+    }
+
+    return state
+
+def simple_fr_optimistic_reset(old_state, epoch_count, do_decrease=True, reset_scaling=1.0):
+    state = {
+        'prediction': zeros_like(old_state['prediction']),
+        'normal_state': simple_fr_reset(old_state['normal_state'], epoch_count, do_decrease, reset_scaling),
+        'hint_state': simple_fr_reset(old_state['hint_state'],  epoch_count, do_decrease, reset_scaling),
+        'hint': zeros_like(old_state['hint']),
+    }
+
+    return state   
+
+def simple_fr_optimistic_update(grad, opt_state, do_logging=False):
+
+    prediction = opt_state['prediction']
+    normal_state = opt_state['normal_state']
+    hint_state = opt_state['hint_state']
+    hint = opt_state['hint']
+
+    normal_state_next, normal_logs = simple_fr_update(grad, normal_state, do_logging)
+
+    hint_grad = tree_map(
+        lambda h, g: g*h,
+        grad,
+        hint,
+    )
+
+    hint_next = grad
+
+    hint_state_next, hint_logs = simple_fr_update(hint_grad, hint_state, do_logging)
+
+    prediction_next = tree_map(
+        lambda np, hp, hn: np + hp*hn, 
+        normal_state_next['prediction'],
+        hint_state_next['prediction'],
+        hint_next,
+    )
+
+
+    opt_state_next = {
+        'prediction': prediction_next,
+        'normal_state': normal_state_next,
+        'hint_state': hint_state_next,
+        'hint': hint_next,
+    }
+
+    return opt_state_next, {
+        'base_lr': normal_state_next['base_lr']
+    }
+
+
     
 
 
