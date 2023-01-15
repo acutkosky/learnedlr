@@ -158,6 +158,72 @@ def adagrad_update(grad, opt_state, do_logging=False):
     return opt_state_next, {'ol_lr': lr}
 
 
+def simple_fr_init(params, base_lr=1.0, eta=1e-6, decay=1.0):
+    state = {
+        'grad_squared_sum': zeros_like(params),
+        'prediction': zeros_like(params),
+        'decay': decay,
+        'eta': eta,
+        'base_lr': base_lr,
+        'grad_sum': zeros_like(params),
+    }
+
+    return state
+
+def simple_fr_reset(old_state, epoch_count, do_decrease=True, reset_scaling=1.0):
+    state = {
+        'grad_squared_sum': zeros_like(old_state['grad_squared_sum']),
+        'prediction': zeros_like(old_state['prediction']),
+        'decay': old_state['decay'],
+        'eta': old_state['eta'],
+        'base_lr':  reset_scaling * old_state['base_lr']*(epoch_count + 1)/(epoch_count + 2) if do_decrease else reset_scaling * old_state['base_lr'],
+        'grad_sum': zeros_like(old_state['grad_sum']),
+    }
+
+    return state   
+
+def simple_fr_update(grad, opt_state, do_logging=False):
+
+    grad_squared_sum = opt_state['grad_squared_sum']
+    prediction = opt_state['prediction']
+    decay = opt_state['decay']
+    eta = opt_state['eta']
+    base_lr = opt_state['base_lr']
+    grad_sum = opt_state['grad_sum']
+
+    grad_sum_next = tree_map(
+        lambda s, g: s * decay + g,
+        grad_sum,
+        grad
+    )
+
+    grad_squared_sum_next = tree_map(
+        lambda s, g: s * decay + g**2,
+        grad_squared_sum,
+        grad
+    )
+
+    prediction_next = tree_map(
+        lambda g, s: -base_lr / jnp.sqrt(1e-8 + s) * jnp.sign(g) * (jnp.exp(eta * jnp.abs(g) / jnp.sqrt(1e-8 + s)) - 1.0),
+        grad_sum_next,
+        grad_squared_sum_next,
+    )
+
+    opt_state_next = {
+        'grad_squared_sum': grad_squared_sum_next,
+        'prediction': prediction_next,
+        'decay': decay,
+        'eta': eta,
+        'base_lr': base_lr,
+        'grad_sum': grad_sum_next,
+    }
+
+    return opt_state_next, {
+        'base_lr': base_lr,
+    }
+
+
+    
 
 
 def adagrad_scaled_init(params, lr=1.0, eps=1e-8, decay=1.0, base_lr=1e-5, reg=1.0):
