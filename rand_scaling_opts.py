@@ -160,7 +160,7 @@ def adagrad_update(grad, opt_state, do_logging=False):
 
 
 
-def adagrad_scaled_init(params, lr=1.0, eps=1e-8, decay=1.0, base_lr=1e-5, reg=2.0):
+def adagrad_scaled_init(params, lr=1.0, eps=1e-8, decay=1.0, base_lr=1e-5, reg=1.0):
     state = {
         'grad_squared_sum': zeros_like(params),
         'prediction': zeros_like(params),
@@ -204,7 +204,7 @@ def adagrad_scaled_update(grad, opt_state, do_logging=False):
 
     prediction_next = tree_map(
         lambda p, g, s: p * decay \
-            - lr * (jnp.abs(p) + base_lr) * (g / (eps + jnp.sqrt(s)) + jnp.sign(p) * g**2/(eps + s)),
+            - lr * (jnp.abs(p) + base_lr) * (g / (eps + jnp.sqrt(s)) + reg * jnp.sign(p) * g**2/(eps + s)),
         prediction,
         grad,
         grad_squared_sum_next
@@ -974,10 +974,16 @@ def OL_momentum_update(rand_scaling_type,
 
     if rand_scaling_type == 'uniform':
         rand_scaling = jax.random.uniform(cur_rng)
+        true_scaling = 1.0
     elif rand_scaling_type == 'half':
         rand_scaling = 0.5
+        true_scaling = 1.0
     elif rand_scaling_type == 'none':
         rand_scaling = 1.0
+        true_scaling = 1.0
+    elif rand_scaling_type == 'exponential':
+        rand_scaling = jax.random.exponential(cur_rng)
+        true_scaling = rand_scaling
  
     constants = model_state['constants']
     params = model_state['params']
@@ -995,11 +1001,11 @@ def OL_momentum_update(rand_scaling_type,
     max_epoch_reward = opt_state['max_epoch_reward']
     weight_decay = opt_state['weight_decay']
 
-    grad = tree_map(
-        lambda g, p: g + weight_decay * p,
-        grad,
-        params
-    )
+    # grad = tree_map(
+    #     lambda g, p: g + weight_decay * p,
+    #     grad,
+    #     params
+    # )
 
     iteration_count_next = iteration_count + 1
 
@@ -1039,8 +1045,9 @@ def OL_momentum_update(rand_scaling_type,
         ol_state_next, epoch_reward_next, max_epoch_reward_next, epoch_count, epoch_start_true_params, true_params)
 
     offset = tree_map(
-        lambda p: jnp.clip(p, a_min=-scale, a_max=scale),
-        ol_state_next['prediction']
+        lambda ol_p, p: jnp.clip(ol_p, a_min=-scale, a_max=scale) - scale * weight_decay * p,
+        ol_state_next['prediction'],
+        true_params,
     )
 
     params_next = tree_map(lambda p, o: p+ rand_scaling * o, true_params, offset)
@@ -1075,9 +1082,11 @@ def OL_momentum_update(rand_scaling_type,
         'params': params_next
     }
 
+    true_params_next = tree_map(lambda p, o: p+ true_scaling*o, true_params, offset)
+
     opt_state_next = {
         'ol_state': ol_state_next,
-        'true_params': tree_map(lambda p, o: p+ o, true_params, offset),
+        'true_params': true_params_next,
         'total_reward': total_reward_next,
         'epoch_reward': epoch_reward_next,
         'iteration_count': iteration_count_next,
@@ -1087,6 +1096,7 @@ def OL_momentum_update(rand_scaling_type,
         'epoch_start_true_params': epoch_start_true_params_next,
         'bad_epoch_count': bad_epoch_count_next,
         'max_epoch_reward': max_epoch_reward_next,
+        'weight_decay': weight_decay,
     }
 
 
@@ -1102,6 +1112,7 @@ def OL_momentum_update(rand_scaling_type,
             'update_norm': tree_norm(offset),
             'grad_norm': tree_norm(grad),
             'max_update_norm': scale * tree_norm(ones_like(offset)),
+            'weight_decay_penalty': weight_decay * tree_norm(params)**2,
         }
         log_dict.update(ol_logs)
         # for key, value in ol_logs.items():
@@ -1113,7 +1124,3 @@ def OL_momentum_update(rand_scaling_type,
     return rng, value, grad, model_state_next, opt_state_next, log_dict
 
     
-   
-
-
-
