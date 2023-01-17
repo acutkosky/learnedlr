@@ -166,6 +166,7 @@ def simple_fr_init(params, base_lr=1.0, eta=1e-6, decay=1.0):
         'eta': eta,
         'base_lr': base_lr,
         'grad_sum': zeros_like(params),
+        'max_grad': zeros_like(params),
     }
 
     return state
@@ -178,11 +179,89 @@ def simple_fr_reset(old_state, epoch_count, do_decrease=True, reset_scaling=1.0)
         'eta': old_state['eta'],
         'base_lr':  reset_scaling * old_state['base_lr']*(epoch_count + 1)/(epoch_count + 2) if do_decrease else reset_scaling * old_state['base_lr'],
         'grad_sum': zeros_like(old_state['grad_sum']),
+        'max_grad': zeros_like(old_state['max_grad'])
     }
 
     return state   
 
 def simple_fr_update(grad, opt_state, do_logging=False):
+
+    grad_squared_sum = opt_state['grad_squared_sum']
+    prediction = opt_state['prediction']
+    decay = opt_state['decay']
+    eta = opt_state['eta']
+    base_lr = opt_state['base_lr']
+    grad_sum = opt_state['grad_sum']
+    max_grad = opt_state['max_grad']
+
+    grad_sum_next = tree_map(
+        lambda s, g: s * decay + g,
+        grad_sum,
+        grad
+    )
+
+    grad_squared_sum_next = tree_map(
+        lambda s, g: s * decay**2 + g**2,
+        grad_squared_sum,
+        grad
+    )
+
+    max_grad_next = tree_map(
+        lambda s, g: jnp.maximum(s * decay, jnp.abs(g)),
+        max_grad,
+        grad
+    )
+
+    prediction_next = tree_map(
+        lambda g, m, s: -base_lr * m / jnp.sqrt(1e-8 + s) * jnp.sign(g) * (jnp.exp(eta * jnp.abs(g) / jnp.sqrt(1e-8 + s)) - 1.0),
+        grad_sum_next,
+        max_grad_next,
+        grad_squared_sum_next,
+    )
+
+    opt_state_next = {
+        'grad_squared_sum': grad_squared_sum_next,
+        'prediction': prediction_next,
+        'decay': decay,
+        'eta': eta,
+        'base_lr': base_lr,
+        'grad_sum': grad_sum_next,
+        'max_grad': max_grad_next
+    }
+
+    return opt_state_next, {
+        'base_lr': base_lr,
+    }
+
+
+
+
+
+def simple_fr_noconst_init(params, base_lr=1.0, eta=1e-6, decay=1.0):
+    state = {
+        'grad_squared_sum': zeros_like(params),
+        'prediction': zeros_like(params),
+        'decay': decay,
+        'eta': eta,
+        'base_lr': base_lr,
+        'grad_sum': zeros_like(params)
+    }
+
+    return state
+
+def simple_fr_noconst_reset(old_state, epoch_count, do_decrease=True, reset_scaling=1.0):
+    state = {
+        'grad_squared_sum': zeros_like(old_state['grad_squared_sum']),
+        'prediction': zeros_like(old_state['prediction']),
+        'decay': old_state['decay'],
+        'eta': old_state['eta'],
+        'base_lr':  reset_scaling * old_state['base_lr']*(epoch_count + 1)/(epoch_count + 2) if do_decrease else reset_scaling * old_state['base_lr'],
+        'grad_sum': zeros_like(old_state['grad_sum'])
+    }
+
+    return state   
+
+def simple_fr_noconst_update(grad, opt_state, do_logging=False):
 
     grad_squared_sum = opt_state['grad_squared_sum']
     prediction = opt_state['prediction']
@@ -198,13 +277,14 @@ def simple_fr_update(grad, opt_state, do_logging=False):
     )
 
     grad_squared_sum_next = tree_map(
-        lambda s, g: s * decay + g**2,
+        lambda s, g: s * decay**2 + g**2,
         grad_squared_sum,
         grad
     )
 
+
     prediction_next = tree_map(
-        lambda g, s: -base_lr / jnp.sqrt(1e-8 + s) * jnp.sign(g) * (jnp.exp(eta * jnp.abs(g) / jnp.sqrt(1e-8 + s)) - 1.0),
+        lambda g, s: -base_lr  * jnp.sign(g) * (jnp.exp(eta * jnp.abs(g) / jnp.sqrt(1e-8 + s)) - 1.0),
         grad_sum_next,
         grad_squared_sum_next,
     )
@@ -215,7 +295,7 @@ def simple_fr_update(grad, opt_state, do_logging=False):
         'decay': decay,
         'eta': eta,
         'base_lr': base_lr,
-        'grad_sum': grad_sum_next,
+        'grad_sum': grad_sum_next
     }
 
     return opt_state_next, {
@@ -1049,6 +1129,7 @@ def OL_momentum_init(params,
         'total_reward': jnp.zeros(1),
         'epoch_reward': jnp.zeros(1),
         'max_epoch_reward': jnp.zeros(1),
+        'last_constraint': 1.0,
         'epoch_count': 0,
         'bad_epoch_count': 0,
         'iteration_count':  0,
@@ -1076,7 +1157,8 @@ def OL_momentum_update(rand_scaling_type,
                        do_logging=False,
                        reset_scaling=0.5,
                        do_decrease_guard=False,
-                       guard_threshold=0.01):
+                       guard_threshold=0.01,
+                       constraint_type='infinity'):
     '''
     update function for online learning based optimizer.
     
@@ -1092,9 +1174,25 @@ def OL_momentum_update(rand_scaling_type,
     do_decrease_guard: if true, check if there is a reward decrease (indicating
         that the loss is increasing), and if so reset to before the decrease happened
         and also decrease the model's learning rate parameter by a factor of reset_scaling.
+    guard_threshold: if do_decrease_guard == True, then every iteration checks if the total reward
+        has decreased by this guard_threshold from the maximum value. If so, we decrease the learning
+        rate and reset to the beginning of the "epoch".
+    constraint_type: string describing how we enforce the constraints specified by "scale" argument (basically,
+        the learning rate). If 'infinity', then we project updates into an L_infinity ball (i.e. clip the 
+        coordinates to [-scale, scale]). If 'l2', then we project into an l2 ball.
+
+        if constraint_type == 'adaptive', then we use L2 constraints, but the use of scaling is different.
+        In this mode, we set the constraint to be: (scaling + max(total_reward, 0))/( (1e-8 + grad_norm) * sqrt(iteration_count))
+
+        Not a lot of theory behind this, but here is the intuition:
+        If we were making truly random-walk progress, we would expect to make about Lipschitz constant * constraint * sqrt(iterations)
+        change in the loss. So, let us at least constraint ourselves to ensure that this value is no larger than
+        our actual progress. This should be an over-estimate since actually we are presumably not a random walk.
+    
     '''
 
     value, grad = loss_and_grad_fn(model_and_example_state)
+    grad_norm = tree_norm(grad)
     model_state = model_and_example_state['model_state']
 
     cur_rng, rng = jax.random.split(rng)
@@ -1127,6 +1225,7 @@ def OL_momentum_update(rand_scaling_type,
     bad_epoch_count = opt_state['bad_epoch_count']
     max_epoch_reward = opt_state['max_epoch_reward']
     weight_decay = opt_state['weight_decay']
+    last_constraint = opt_state['last_constraint']
 
     # grad = tree_map(
     #     lambda g, p: g + weight_decay * p,
@@ -1157,11 +1256,25 @@ def OL_momentum_update(rand_scaling_type,
     temp_epoch_reward_next = epoch_reward_next
 
 
-    # apply constraint set reduction for 1-D intervals
-    constrained_grad = tree_map(
-        lambda o, g: jnp.where(-o * jnp.sign(g) >= scale, jnp.zeros_like(g), g),
-        ol_prediction,
-        grad)
+    # apply constraint set reduction.
+    if constraint_type == 'infinity':
+        constrained_grad = tree_map(
+            lambda o, g: jnp.where(-o * jnp.sign(g) >= last_constraint, jnp.zeros_like(g), g),
+            ol_prediction,
+            grad)
+    elif constraint_type == 'l2' or constraint_type == 'adaptive':
+        prev_prediction_norm = tree_norm(ol_prediction)
+
+        # compute gradient projection along prediction direction. We only need this if it is negative, and the prediction norm
+        # is bigger than the constraint. That is, we only want to correct the gradient if the gradient is
+        # pushing us further outside the constraint.
+        prediction_grad_projection = jnp.minimum(tree_dot(ol_prediction, grad)/prev_prediction_norm**2, 0) * (prev_prediction_norm > last_constraint)
+        constrained_grad = tree_map(
+            lambda p, g: g - prediction_grad_projection * p,
+            ol_prediction,
+            grad
+        )
+
 
     ol_state_next, ol_logs = ol_update(constrained_grad, ol_state, do_logging)
 
@@ -1171,11 +1284,29 @@ def OL_momentum_update(rand_scaling_type,
         lambda s, r, mr, c, esp, tp: (s, r, mr, c, esp),
         ol_state_next, epoch_reward_next, max_epoch_reward_next, epoch_count, epoch_start_true_params, true_params)
 
-    offset = tree_map(
-        lambda ol_p, p: jnp.clip(ol_p, a_min=-scale, a_max=scale) - scale * weight_decay * p,
-        ol_state_next['prediction'],
-        true_params,
-    )
+
+    # apply constraints
+    if constraint_type == 'infinity':
+        offset = tree_map(
+            lambda ol_p, p: jnp.clip(ol_p, a_min=-scale, a_max=scale) - scale * weight_decay * p,
+            ol_state_next['prediction'],
+            true_params,
+        )
+        last_constraint_update = scale
+    elif constraint_type == 'l2' or constraint_type == 'adaptive':
+
+        if constraint_type == 'adaptive':
+            scale = (scale + jnp.maximum(total_reward_next, 0))/((1e-8  + grad_norm) * jnp.sqrt(iteration_count_next))
+
+        ol_prediction_norm = tree_norm(ol_state_next['prediction'])
+        truncated_scale = jnp.minimum(1.0, scale/ol_prediction_norm)
+
+        offset = tree_map(
+            lambda ol_p, p: ol_p * truncated_scale - scale * weight_decay * p,
+            ol_state_next['prediction'],
+            true_params,
+        )
+        last_constraint_update = scale
 
     params_next = tree_map(lambda p, o: p+ rand_scaling * o, true_params, offset)
 
@@ -1224,10 +1355,15 @@ def OL_momentum_update(rand_scaling_type,
         'bad_epoch_count': bad_epoch_count_next,
         'max_epoch_reward': max_epoch_reward_next,
         'weight_decay': weight_decay,
+        'last_constraint': last_constraint_update,
     }
 
 
     if do_logging:
+        if constraint_type == 'infinity':
+            max_update_norm = scale * tree_norm(ones_like(offset))
+        else:
+            max_update_norm = scale
         log_dict = {
             'total_reward': total_reward_next,
             'epoch_reward': epoch_reward_next,
@@ -1237,9 +1373,17 @@ def OL_momentum_update(rand_scaling_type,
             'reward_increment': reward_increment,
             'max_epoch_reward': max_epoch_reward_next,
             'update_norm': tree_norm(offset),
-            'grad_norm': tree_norm(grad),
-            'max_update_norm': scale * tree_norm(ones_like(offset)),
+            'unconstrained_update_norm': tree_norm(ol_state_next['prediction']),
+            'unconstrainted_update_diff': tree_norm(tree_map(
+                lambda x, y: x-y,
+                ol_state_next['prediction'],
+                ol_state['prediction']
+            )),
+            'grad_norm': grad_norm,
+            'max_update_norm': max_update_norm,
             'weight_decay_penalty': weight_decay * tree_norm(params)**2,
+            'param_norm': tree_norm(params),
+            'const_grad_pred_prod': tree_dot(constrained_grad, ol_prediction),
         }
         log_dict.update(ol_logs)
         # for key, value in ol_logs.items():
