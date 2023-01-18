@@ -29,8 +29,9 @@ def tree_norm(tree):
 
 def clip_by_global_norm(tree, clip):
     norm = tree_norm(tree)
+    scaling = jnp.minimum(1.0, clip/(1e-8 + norm))
     return tree_map(
-        lambda x: x/(1e-8 + norm),
+        lambda x: scaling * x,
         tree
     )
 
@@ -1425,10 +1426,16 @@ def OL_momentum_update(rand_scaling_type,
 # initialization:
 #
 # params = model_state['params'] # or however the params are stored.
-# rescaling_state = init_learned_scale(params, simple_fr_init, base_lr=1e-4, eta=0.5, decay=0.999)
+# rescaling_state = init_learned_scale(params, simple_fr_init, base_lr=1e0, eta=0.5, decay=0.999)
 # rescaling_fn = functools.partial(learned_scale_update, simple_fr_update)
 #
-# (probably initialize your optax uptimizer with a learning rate of 1.0 or similar).
+# (probably initialize your optax uptimizer with whatever standard learning rate schedule or similar).
+# (alternatively, you could initialize the optax optimizer with a larger constant learning rate, but
+#  for numerical precision issues it might be important to be not too big. Technically, the "first 
+#  learning rate" that the learner will try will be ~ base_lr * optax_lr, and theoretically if
+#  this product is held constant at initialization the computations will be identical. However
+#  in practice I think having a large optax_lr can cause some issues with adding small and large
+#  numbers together.)
 #
 # # in training loop:
 # grad = grad_fn(params, minibatch)
@@ -1447,6 +1454,8 @@ def init_learned_scale(params, ol_init=simple_fr_init, min_scale=1e-6, max_scale
         'min_scale': min_scale,
         'max_scale': max_scale,
         'constraint_violation': jnp.zeros(1),
+        'estimated_loss_gap': jnp.zeros(1),
+        'prev_nonrand_scaling': jnp.zeros(1),
     }
 
     return update_state
@@ -1474,6 +1483,8 @@ def learned_scale_update(ol_update, rng, state, grad, updates):
         rng: next value for the rng.
         rescaled_update: rescaled value of the update that can be applied via
             optax.apply_updates.
+        log_data: a dict of values it might be useful to log somewhere (can be ignored
+            if no logging is desired)
     '''
 
 
@@ -1483,6 +1494,8 @@ def learned_scale_update(ol_update, rng, state, grad, updates):
     min_scale = state['min_scale']
     max_scale = state['max_scale']
     constraint_violation = state['constraint_violation']
+    estimated_loss_gap = state['estimated_loss_gap']
+    prev_nonrand_scaling = state['prev_nonrand_scaling']
 
 
     rng, cur_rng = jax.random.split(rng)
@@ -1492,6 +1505,8 @@ def learned_scale_update(ol_update, rng, state, grad, updates):
     
 
     ol_grad = tree_dot(prev_updates, grad)
+
+    estimated_loss_gap_next = estimated_loss_gap + prev_nonrand_scaling * ol_grad
 
     # process gradient for enforcing constraints:
     ol_grad = jnp.where(
@@ -1509,7 +1524,7 @@ def learned_scale_update(ol_update, rng, state, grad, updates):
     constraint_violation_next = unclipped_nonrand_scale - clipped_nonrand_scale
 
     scaling = rand * clipped_nonrand_scale
-    missing_scaling = (1.0 - rand) * clipped_nonrand_scale
+    missing_scaling_next = (1.0 - rand) * clipped_nonrand_scale
 
 
     #
@@ -1517,7 +1532,7 @@ def learned_scale_update(ol_update, rng, state, grad, updates):
     # param_{t} = true_param_{t-1} + rand_{t-1} * nonrand_scale_{t-1} * update_{t-1}
     #
     # param_{t+1} = true_param_{t} + rand * nonrand_scale_{t} * update_{t}
-    #             = param_{t} + (1-rand_{t-1}) * nonrand_scale_{t-1} * update_{t-1} + rand * nonrand_scale_{t} * update_{t}
+    #             = param_{t} + (1-rand_{t-1}) * nonrand_scale_{t-1} * update_{t-1} + rand_t * nonrand_scale_{t} * update_{t}
     rescaled_update = tree_map(
         lambda u, p_u: missing_scaling * p_u + scaling * u, 
         updates,
@@ -1526,12 +1541,96 @@ def learned_scale_update(ol_update, rng, state, grad, updates):
 
     state_next = {
         'prev_updates': updates,
-        'missing_scaling': missing_scaling,
+        'missing_scaling': missing_scaling_next,
         'ol_state': ol_state_next,
         'min_scale': min_scale,
         'max_scale': max_scale,
-        'constraint_violation': constraint_violation_next
+        'constraint_violation': constraint_violation_next,
+        'estimated_loss_gap': estimated_loss_gap_next,
+        'prev_nonrand_scaling': clipped_nonrand_scale,
     }
 
-    return state_next, rng, rescaled_update
+    log_data = {
+        'estimated_loss_gap': estimated_loss_gap_next,
+        'random_learned_scaling': scaling,
+        'nonrandom_learned_scaling': clipped_nonrand_scale,
+    }
+
+    return state_next, rng, rescaled_update, log_data
+
+
+
+
+
+
+##### randomly scale the update ######
+#
+# These functions simply randomly scale the updates, without using an online learner.
+#
+# usage is nearly the same, but no need to provide online learning info.
+
+
+
+def init_random_scale(params):
+    update_state = {
+        'prev_updates': zeros_like(params),
+        'missing_scaling': jnp.zeros(1),
+        'estimated_loss_gap': jnp.zeros(1),
+    }
+
+    return update_state
+
+def random_scale_update(rng, state, grad, updates):
+    '''
+    rescales an update with a random number.
+    
+    args:
+        rng: jax rng.
+        state: state for this scaling learner.
+        grad: (unused, only here so that it has the same signature as learned_scale_update).
+        updates: updates from base algorithm to rescale. Should be same
+            pytree shape as the "params" argument provided to "init_random_scale".
+    
+    returns:
+        state_next: next value for the state.
+        rng: next value for the rng.
+        rescaled_update: rescaled value of the update that can be applied via
+            optax.apply_updates.
+        log_data: a dictionary of stuff to log 
+    '''
+
+
+    prev_updates = state['prev_updates']
+    missing_scaling = state['missing_scaling']
+    estimated_loss_gap = state['estimated_loss_gap']
+
+    grad_product = tree_dot(prev_updates, grad)
+
+    estimated_loss_gap_next = estimated_loss_gap + grad_product
+
+    rng, cur_rng = jax.random.split(rng)
+
+    rand = jax.random.uniform(cur_rng)
+    missing_scaling_next = (1.0 - rand)
+
+
+    #
+    # true_param_{t} = true_param_{t-1} + nonrand_scale_{t-1} * update_{t-1}
+    # param_{t} = true_param_{t-1} + rand_{t-1} * update_{t-1}
+    #
+    # param_{t+1} = true_param_{t} + rand * nonrand_scale_{t} * update_{t}
+    #             = param_{t} + (1-rand_{t-1}) * update_{t-1} + rand_t * update_{t}
+    rescaled_updates = tree_map(
+        lambda u, p_u: missing_scaling * p_u + rand * u, 
+        updates,
+        prev_updates,
+    )
+
+    state_next = {
+        'prev_updates': updates,
+        'missing_scaling': missing_scaling_next,
+        'estimated_loss_gap': estimated_loss_gap_next,
+    }
+
+    return state_next, rng, rescaled_updates, {}
 

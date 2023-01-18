@@ -44,6 +44,56 @@ parser.add_argument('--train_config', type=str, default='config/train/base.yaml'
 def optax_init(optimizer, model_state):
     return optimizer.init(model_state)
 
+def wrap_opt_step(base_step, base_state, optax_opt_fn, model_state, clip, *args, **kwargs):
+    # loss_and_grad_fn, rng, model_and_example_state, opt_state, scale, do_logging=False):
+    optax_opt = optax_opt_fn(*args, **kwargs)
+    optax_opt_state =optax_opt.init(model_state['params'])
+
+    opt_state = {
+        'base_state': base_state,
+        'optax_state': optax_opt_state,
+    }
+
+    def update_step(loss_and_grad_fn, rng, model_and_example_state, opt_state, scale, do_logging=False):
+
+        value, grad = loss_and_grad_fn(model_and_example_state)
+
+        clipped_grad = jax.tree_util.tree_map(
+            lambda g: g * jnp.minimum(1.0, clip/(1e-8+ jnp.linalg.norm(g))),
+            grad
+        )
+
+        model_state = model_and_example_state['model_state']
+        constants = model_state['constants']
+        params = model_state['params']
+        
+        optax_opt_state = opt_state['optax_state']
+        base_state = opt_state['base_state']
+
+        updates, optax_opt_state = optax_opt.update(clipped_grad,  optax_opt_state, model_state['params'])
+
+        updates = jax.tree_util.tree_map(lambda p: scale * p, updates)
+
+        base_state, rng, rescaled_updates, logs = base_step(rng, base_state, grad, updates, model_state['params'])
+
+        opt_state = {
+            'optax_state': optax_opt_state,
+            'base_state': base_state,
+        }
+
+
+        params = optax.apply_updates(params, rescaled_updates)
+        model_state = {'constants': constants, 'params': params}
+
+        logs.update({
+            'scale': scale
+        })
+
+        return rng, value, grad, model_state, opt_state, logs
+    
+    return opt_state, update_step
+
+
 
 def optax_state_and_step(optimizer, model_state, clip, *args, **kwargs):
     optimizer = optimizer(*args,  **kwargs)
@@ -126,6 +176,7 @@ class Trainer:
             # self.optimizer_step = opt_jax.adamw
             self.optimizer_state, self.optimizer_step = optax_state_and_step(optax.adamw, model_state, config.clip, learning_rate=1.0, b1=config.beta1, b2=config.beta2, weight_decay=config.wd)
             # self.optimizer_step = jax.jit(self.optimizer_step)
+        
         if self.config.optimizer == 'custom':
             if self.config.custom_opt.name == 'adamw':
                 self.optimizer_state = opt_jax.adamw_init(model_state['params'], lr=1.0, beta1=config.beta1, beta2=config.beta2, wd=config.wd)
@@ -233,7 +284,28 @@ class Trainer:
                     rand_scaling_type=opt_conf.rand_scaling_type,
                     use_loss_diff=opt_conf.use_loss_diff
                 )
-                
+        if self.config.optimizer == 'test_optax_scale':
+            base_state = rand_scaling_opts.init_learned_scale(
+                model_state['params'],
+                rand_scaling_opts.simple_fr_init,
+                base_lr=1e0,
+                eta=1.0,
+                decay=0.999,
+                max_scale=1e1)
+            base_step = functools.partial(
+                rand_scaling_opts.learned_scale_update,
+                rand_scaling_opts.simple_fr_update,
+            )
+
+            self.optimizer_state, self.optimizer_step = wrap_opt_step(base_step, base_state, optax.adamw, model_state, config.clip, learning_rate=1.0, b1=config.beta1, b2=config.beta2, weight_decay=config.wd)#, *args, **kwargs)
+
+        if self.config.optimizer == 'test_optax_random_scale':
+            base_state = rand_scaling_opts.init_random_scale(
+                model_state['params']
+            )
+            base_step = rand_scaling_opts.random_scale_update
+
+            self.optimizer_state, self.optimizer_step = wrap_opt_step(base_step, base_state, optax.adamw, model_state, config.clip, learning_rate=1.0, b1=config.beta1, b2=config.beta2, weight_decay=config.wd)
 
         # self.losses = []
 
