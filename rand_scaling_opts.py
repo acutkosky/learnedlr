@@ -1395,3 +1395,126 @@ def OL_momentum_update(rand_scaling_type,
     return rng, value, grad, model_state_next, opt_state_next, log_dict
 
     
+
+
+####### more optax-compatible version ######
+
+# usage example (assuming simple_fr_init is the online learner. It takes two main arguments: base_lr and eta.
+# eta should probably not be bigger than 1/sqrt(2)~0.7 unless you want the scale to grow even with random inputs.)
+#
+# # CAUTION: be careful clipping the "grad" argument you provide to learned_scale_update: it has been
+# # more sensitive to aggressive clipping in some experiments.
+#
+# initialization:
+#
+# params = model_state['params'] # or however the params are stored.
+# rescaling_state = init_learned_scale(params, simple_fr_init, base_lr=1e-4, eta=0.5, decay=0.99)
+# rescaling_fn = functools.partial(learned_scale_update, simple_fr_update)
+#
+# (probably initialize your optax uptimizer with a learning rate of 1.0 or similar).
+#
+# # in training loop:
+# grad = grad_fn(params, minibatch)
+# updates, opt_state = optax_optimizer.update(grad,  optax_state, model_state['params'])
+# scaling_state, rng, rescaled_updates = rescaling_fn(rng, rescaling_state, grad, updates)
+# params = optax.apply_updates(params, rescaled_updates)
+#
+
+
+def init_learned_scale(params, ol_init=simple_fr_init, min_scale=1e-6, max_scale=1e-2, *ol_args, **ol_kwargs):
+    ol_state = ol_init(jnp.zeros(1), *ol_args, **ol_kwargs)
+    update_state = {
+        'prev_updates': zeros_like(params),
+        'missing_scaling': jnp.zeros(1),
+        'ol_state': ol_state,
+        'min_scale': min_scale,
+        'max_scale': max_scale,
+        'constraint_violation': jnp.zeros(1),
+    }
+
+    return update_state
+
+def learned_scale_update(ol_update, rng, state, grad, updates):
+    '''
+    rescales an update with an online learner.
+    
+    args:
+        ol_update: function that updates an online learner.
+            Takes as input an online learner state and a (meta)-gradient.
+            Returns a new online learner state and some logs dict (which we ignore).
+
+            *** this argument is not a jax type, so it should be removed with a partial
+                or set as a static argument in order to compile ***
+
+        rng: jax rng.
+        state: state for this scaling learner.
+        grad: gradient of loss.
+        update: update from base algorithm to rescale. Should be same
+            pytree shape as grad.
+    
+    returns:
+        state_next: next value for the state.
+        rng: next value for the rng.
+        rescaled_update: rescaled value of the update that can be applied via
+            optax.apply_updates.
+    '''
+
+
+    prev_updates = state['prev_updates']
+    missing_scaling = state['missing_scaling']
+    ol_state = state['ol_state']
+    min_scale = state['min_scale']
+    max_scale = state['max_scale']
+    constraint_violation = state['constraint_violation']
+
+
+    rng, cur_rng = jax.random.split(rng)
+
+    rand = jax.random.uniform(cur_rng)
+
+    
+
+    ol_grad = tree_dot(prev_updates, grad)
+
+    # process gradient for enforcing constraints:
+    ol_grad = jnp.where(
+            -constraint_violation * jnp.sign(ol_grad) > 1e-8, # should be == 0 when no clipping happens, but idk about floating point stuff.
+            jnp.zeros_like(ol_grad),
+            ol_grad)
+    
+    ol_state_next, ol_logs = ol_update(ol_grad, ol_state)
+    del ol_logs
+
+    unclipped_nonrand_scale = ol_state_next['prediction']
+
+    clipped_nonrand_scale = jnp.clip(unclipped_nonrand_scale, a_min=min_scale, a_max=max_scale)
+
+    constraint_violation_next = unclipped_nonrand_scale - clipped_nonrand_scale
+
+    scaling = rand * clipped_nonrand_scale
+    missing_scaling = (1.0 - rand) * clipped_nonrand_scale
+
+
+    #
+    # true_param_{t} = true_param_{t-1} + nonrand_scale_{t-1} * update_{t-1}
+    # param_{t} = true_param_{t-1} + rand_{t-1} * nonrand_scale_{t-1} * update_{t-1}
+    #
+    # param_{t+1} = true_param_{t} + rand * nonrand_scale_{t} * update_{t}
+    #             = param_{t} + (1-rand_{t-1}) * nonrand_scale_{t-1} * update_{t-1} + rand * nonrand_scale_{t} * update_{t}
+    rescaled_update = tree_map(
+        lambda u, p_u: missing_scaling * p_u + scaling * u, 
+        updates,
+        prev_updates,
+    )
+
+    state_next = {
+        'prev_updates': updates,
+        'missing_scaling': missing_scaling,
+        'ol_state': ol_state_next,
+        'min_scale': min_scale,
+        'max_scale': max_scale,
+        'constraint_violation': constraint_violation_next
+    }
+
+    return state_next, rng, rescaled_update
+
