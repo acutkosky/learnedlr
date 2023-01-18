@@ -1418,7 +1418,8 @@ def OL_momentum_update(rand_scaling_type,
 ####### more optax-compatible version ######
 
 # usage example (assuming simple_fr_init is the online learner. It takes two main arguments: base_lr and eta.
-# eta should probably not be bigger than 1/sqrt(2)~0.7 unless you want the scale to grow even with random inputs.)
+# eta should possibly not be bigger than 1/sqrt(2)~0.7 unless you want the scale to grow even with random inputs.
+# however, I'm not sure that growing with random inputs is actually bad...)
 #
 # # CAUTION: be careful clipping the "grad" argument you provide to learned_scale_update: it has been
 # # more sensitive to aggressive clipping in some experiments.
@@ -1426,7 +1427,7 @@ def OL_momentum_update(rand_scaling_type,
 # initialization:
 #
 # params = model_state['params'] # or however the params are stored.
-# rescaling_state = init_learned_scale(params, simple_fr_init, base_lr=1e0, eta=0.5, decay=0.999)
+# rescaling_state = init_learned_scale(params, simple_fr_init, base_lr=1e0, eta=1.0, decay=0.999)
 # rescaling_fn = functools.partial(learned_scale_update, simple_fr_update)
 #
 # (probably initialize your optax uptimizer with whatever standard learning rate schedule or similar).
