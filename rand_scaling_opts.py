@@ -36,7 +36,7 @@ def clip_by_global_norm(tree, clip):
 
 def clip_by_variable_norm(tree, clip):
     return tree_map(
-        lambda x: x/(1e-8 + jnp.linalg.norm(x)),
+        lambda x: x * jnp.minimum(1.0, clip/(1e-8 + jnp.linalg.norm(x))),
         tree
     )
     
@@ -878,6 +878,8 @@ def optax_ol_scaled_init(
         'lower_bound': lower_bound,
         'upper_bound': upper_bound,
         'prev_lr': jnp.zeros(1),
+        'total_reward': jnp.zeros(1),
+        'prev_rand_scaling': jnp.zeros(1),
     }
     return state, functools.partial(
         optax_ol_scaled_update,
@@ -954,7 +956,8 @@ def optax_ol_scaled_update(
     lower_bound = opt_state['lower_bound']
     upper_bound = opt_state['upper_bound']
     prev_lr = opt_state['prev_lr']
-
+    prev_rand_scaling = opt_state['prev_rand_scaling']
+    total_reward = opt_state['total_reward']
 
     model_state = model_and_example_state['model_state']
 
@@ -984,6 +987,8 @@ def optax_ol_scaled_update(
     else:
         ol_grad = tree_dot(grad, prev_update)
 
+    total_reward_next = total_reward + prev_lr * ol_grad
+
     ol_grad = jnp.where(
             -constraint_violation * jnp.sign(ol_grad) > 1e-8, # should be == 0 when no clipping happens, but idk about floating point stuff.
             jnp.zeros_like(ol_grad),
@@ -1004,29 +1009,34 @@ def optax_ol_scaled_update(
 
 
 
-    if rand_scaling_type == 'uniform':
+    if 'uniform' in rand_scaling_type:
         cur_rng, rng  = jax.random.split(rng)
         rand_scaling = jax.random.uniform(cur_rng)
         rand_scaled_lr = rand_scaling * final_lr
         true_scaled_lr = final_lr
-    elif rand_scaling_type == 'exponential':
+    elif 'exponential' in rand_scaling_type:
         cur_rng, rng  = jax.random.split(rng)
         rand_scaling = -jnp.log(jax.random.uniform(cur_rng))
         rand_scaled_lr = rand_scaling * final_lr
         true_scaled_lr = rand_scaling * final_lr # the point of exponential is that these are the same!
-    elif rand_scaling_type == 'half':
+    elif 'half' in rand_scaling_type:
         rand_scaled_lr = 0.5 * final_lr
         true_scaled_lr = final_lr
-    elif rand_scaling_type == 'none':        
+    elif 'none' in rand_scaling_type:        
         rand_scaled_lr = final_lr
         true_scaled_lr = final_lr
     else:
         raise(NotImplementedError, "unknown rand scaling!")
 
-
     # clip gradients
-    grad = clip_by_variable_norm(grad, clip)
-    update, optax_state_next = optax_opt.update(grad,  optax_state, params)
+    clipped_grad = clip_by_variable_norm(grad, clip)
+    update, optax_state_next = optax_opt.update(clipped_grad,  optax_state, params)
+
+    if 'scale_by_lr' in rand_scaling_type:
+        update = tree_map(
+            lambda u: lr * u,
+            update
+        )
 
 
     param_next = tree_map(
@@ -1054,7 +1064,9 @@ def optax_ol_scaled_update(
         'lower_bound': lower_bound,
         'upper_bound': upper_bound,
         'constraint_violation': constraint_violation_next,
-        'prev_lr': final_lr
+        'prev_lr': final_lr,
+        'prev_rand_scaling': rand_scaled_lr,
+        'total_reward': total_reward_next,
     }
 
     model_state_next = {
@@ -1068,6 +1080,11 @@ def optax_ol_scaled_update(
             'rand_scaled_lr': rand_scaled_lr,
             'learned_lr': final_lr,
             'unconstrained_residual': ol_state_next['prediction'],
+            'ol_optax_total_reward': total_reward_next,
+            'grad_norm': tree_norm(grad),
+            'scaled_update_norm': rand_scaled_lr * tree_norm(update),
+            'ol_grad': ol_grad,
+            'update_norm': tree_norm(update),
         }
 
         log_dict.update(ol_logs)
