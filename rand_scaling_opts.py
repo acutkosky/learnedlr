@@ -1408,7 +1408,7 @@ def OL_momentum_update(rand_scaling_type,
 # initialization:
 #
 # params = model_state['params'] # or however the params are stored.
-# rescaling_state = init_learned_scale(params, simple_fr_init, base_lr=1e-4, eta=0.5, decay=0.99)
+# rescaling_state = init_learned_scale(params, simple_fr_init, base_lr=1e-4, eta=0.5, decay=0.999)
 # rescaling_fn = functools.partial(learned_scale_update, simple_fr_update)
 #
 # (probably initialize your optax uptimizer with a learning rate of 1.0 or similar).
