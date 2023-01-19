@@ -1427,7 +1427,7 @@ def OL_momentum_update(rand_scaling_type,
 # initialization:
 #
 # params = model_state['params'] # or however the params are stored.
-# rescaling_state = init_learned_scale(params, simple_fr_init, base_lr=1e0, eta=1.0, decay=0.999)
+# rescaling_state = init_learned_scale(params, simple_fr_init, base_lr=1e0, eta=1.0, decay=0.999, min_bound=1e-6, max_bound=1e1)
 # rescaling_fn = functools.partial(learned_scale_update, simple_fr_update)
 #
 # (probably initialize your optax uptimizer with whatever standard learning rate schedule or similar).
@@ -1446,7 +1446,7 @@ def OL_momentum_update(rand_scaling_type,
 #
 
 
-def init_learned_scale(params, ol_init=simple_fr_init, min_scale=1e-6, max_scale=1e-2, *ol_args, **ol_kwargs):
+def init_learned_scale(params, ol_init=simple_fr_init, min_scale=1e-6, max_scale=1e1, *ol_args, **ol_kwargs):
     ol_state = ol_init(jnp.zeros(1), *ol_args, **ol_kwargs)
     update_state = {
         'prev_updates': zeros_like(params),
@@ -1555,6 +1555,7 @@ def learned_scale_update(ol_update, rng, state, grad, updates):
         'estimated_loss_gap': estimated_loss_gap_next,
         'random_learned_scaling': scaling,
         'nonrandom_learned_scaling': clipped_nonrand_scale,
+        'grad_norm': tree_norm(grad)
     }
 
     return state_next, rng, rescaled_update, log_data
