@@ -1675,6 +1675,9 @@ def random_scale_update(rng, state, grad, updates):
 # opt_state, updates, logs = update_fn(grad, opt_state, params) # could optionally provide the do_logging flag as a final argument here if desired.
 # params = optax.apply_updates(params, updates)
 #
+#
+# if you want to adjust the learning rate on-the-fly, it is accesible in opt_state['lr']
+#
 #####
     
 
