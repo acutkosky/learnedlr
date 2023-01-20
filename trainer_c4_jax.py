@@ -44,6 +44,24 @@ parser.add_argument('--train_config', type=str, default='config/train/base.yaml'
 def optax_init(optimizer, model_state):
     return optimizer.init(model_state)
 
+def wrap_new_ol_opt_step(update_fn):
+
+    def update_step(loss_and_grad_fn, rng, model_and_example_state, opt_state, scale, do_logging=False):
+        value, grad = loss_and_grad_fn(model_and_example_state)
+        model_state = model_and_example_state['model_state']
+        constants = model_state['constants']
+        params = model_state['params']
+        updates, opt_state, logs = update_fn(grad,  opt_state, model_state['params'], do_logging)
+
+
+
+        params = optax.apply_updates(params, updates)
+        model_state = {'constants': constants, 'params': params}
+
+        return rng, value, grad, model_state, opt_state, logs
+
+    return update_step
+
 def wrap_opt_step(base_step, base_state, optax_opt_fn, model_state, clip, *args, **kwargs):
     # loss_and_grad_fn, rng, model_and_example_state, opt_state, scale, do_logging=False):
     optax_opt = optax_opt_fn(*args, **kwargs)
@@ -263,7 +281,28 @@ class Trainer:
                     rand_scaling_type=opt_conf.rand_scaling_type,
                     use_loss_diff=opt_conf.use_loss_diff
                 )
-                
+
+            if self.config.custom_opt.name == 'ol_momentum_2_wrapped':
+                opt_conf = config.custom_opt.ol_momentum_2
+                rng, new_rng = jax.random.split(rng)
+
+                self.optimizer_state, update_fn = rand_scaling_opts.wrap_ol_momentum_like_optax(
+                    model_state['params'],
+                    rng=new_rng,
+                    lr=config.lr,
+                    weight_decay=config.wd,
+                    ol_init=getattr(rand_scaling_opts, opt_conf.ol_init),
+                    ol_args=to_container(opt_conf.ol_args),
+                    ol_kwargs=to_container(opt_conf.ol_kwargs),
+                    ol_update_fn=getattr(rand_scaling_opts, opt_conf.ol_update_fn),
+                    ol_reset_fn=getattr(rand_scaling_opts, opt_conf.ol_reset_fn),
+                    ol_reset_kwargs=to_container(opt_conf.ol_reset_kwargs),
+                    ol_update_kwargs=to_container(opt_conf.ol_update_kwargs),
+                    reset_threshold=opt_conf.reset_threshold,
+                    rand_scaling_type=opt_conf.rand_scaling_type,
+                )
+
+                self.optimizer_step = wrap_new_ol_opt_step(update_fn)
 
             if self.config.custom_opt.name == 'optax_ol_scaled':
                 opt_conf = config.custom_opt.optax_ol_scaled
@@ -288,13 +327,14 @@ class Trainer:
             base_state = rand_scaling_opts.init_learned_scale(
                 model_state['params'],
                 rand_scaling_opts.simple_fr_init,
-                base_lr=1e0,
-                eta=1.0,
+                base_lr=1.0,
+                eta=0.7,
                 decay=0.999,
                 max_scale=1e1)
             base_step = functools.partial(
                 rand_scaling_opts.learned_scale_update,
                 rand_scaling_opts.simple_fr_update,
+                'uniform',
             )
 
             self.optimizer_state, self.optimizer_step = wrap_opt_step(base_step, base_state, optax.adamw, model_state, config.clip, learning_rate=1.0, b1=config.beta1, b2=config.beta2, weight_decay=config.wd)#, *args, **kwargs)
@@ -306,6 +346,7 @@ class Trainer:
             base_step = rand_scaling_opts.random_scale_update
 
             self.optimizer_state, self.optimizer_step = wrap_opt_step(base_step, base_state, optax.adamw, model_state, config.clip, learning_rate=1.0, b1=config.beta1, b2=config.beta2, weight_decay=config.wd)
+
 
         # self.losses = []
 

@@ -1440,7 +1440,11 @@ def OL_momentum_update(rand_scaling_type,
 #
 # # in training loop:
 # grad = grad_fn(params, minibatch)
+#
 # updates, opt_state = optax_optimizer.update(grad,  optax_state, model_state['params'])
+# ### note: updates could (and maybe should) already have some learning rate schedule applied!
+# ### then, the scaling will learn a way to rescale that schedule appropriately.
+#
 # scaling_state, rng, rescaled_updates = rescaling_fn(rng, rescaling_state, grad, updates)
 # params = optax.apply_updates(params, rescaled_updates)
 #
@@ -1461,7 +1465,7 @@ def init_learned_scale(params, ol_init=simple_fr_init, min_scale=1e-6, max_scale
 
     return update_state
 
-def learned_scale_update(ol_update, rng, state, grad, updates):
+def learned_scale_update(ol_update, rand_scale_type, rng, state, grad, updates):
     '''
     rescales an update with an online learner.
     
@@ -1469,6 +1473,7 @@ def learned_scale_update(ol_update, rng, state, grad, updates):
         ol_update: function that updates an online learner.
             Takes as input an online learner state and a (meta)-gradient.
             Returns a new online learner state and some logs dict (which we ignore).
+        rand_scale_type: 'uniform', 'exponential', or 'none'
 
             *** this argument is not a jax type, so it should be removed with a partial
                 or set as a static argument in order to compile ***
@@ -1501,7 +1506,18 @@ def learned_scale_update(ol_update, rng, state, grad, updates):
 
     rng, cur_rng = jax.random.split(rng)
 
-    rand = jax.random.uniform(cur_rng)
+    if rand_scale_type == 'uniform':
+        rand = jax.random.uniform(cur_rng)
+        missing_rand = (1.0 - rand)
+    elif rand_scale_type == 'exponential':
+        rand = jax.random.exponential(cur_rng)
+        missing_rand = 0.0
+    elif rand_scale_type == 'half':
+        rand = 0.5
+        missing_rand = 0.5
+    elif rand_scale_type == 'none':
+        rand = 1.0
+        missing_rand = 0.0
 
     
 
@@ -1525,7 +1541,7 @@ def learned_scale_update(ol_update, rng, state, grad, updates):
     constraint_violation_next = unclipped_nonrand_scale - clipped_nonrand_scale
 
     scaling = rand * clipped_nonrand_scale
-    missing_scaling_next = (1.0 - rand) * clipped_nonrand_scale
+    missing_scaling_next = missing_rand * clipped_nonrand_scale
 
 
     #
@@ -1635,4 +1651,149 @@ def random_scale_update(rng, state, grad, updates):
     }
 
     return state_next, rng, rescaled_updates, {}
+
+
+
+##### 
+# OPTIMIZER THAT IS (MOSTLY) ACTUALLY ANALYZED IN THE PAPER
+#
+#  usage:
+#
+# opt_state, update_fn = wrap_ol_momentum_like_optax(params, lr, rng, weight_decay,
+#    ol_kwargs={
+#        'base-lr':  1e-4,
+#        'eta': 1.0,
+#        'decay': 0.99
+#    },
+#    ol_update_kwargs={'constraint_type': 'l2'} # best to leave all other arguments as default probably. These are the only ones I'd recommend trying to change.
+#    )
+#
+#
+# in training loop:
+# grads = grad_fn(params, minibatch)  # should have same pytree shape  as params argument above.
+#
+# opt_state, updates, logs = update_fn(grad, opt_state, params) # could optionally provide the do_logging flag as a final argument here if desired.
+# params = optax.apply_updates(params, updates)
+#
+#####
+    
+
+
+def wrap_ol_momentum_like_optax(
+    params,
+    lr,
+    rng,
+    weight_decay=0.0,
+    ol_init=simple_fr_init,
+    ol_args=[],
+    ol_kwargs={
+        'base-lr':  1e-4,
+        'eta': 1.0,
+        'decay': 0.99
+    },
+    ol_update_fn=simple_fr_update,
+    ol_reset_fn=simple_fr_reset,
+    ol_reset_kwargs={'do_decrease': False}, # this will never be called anyway by default unless 'reset_threshold' is set to a non-huge value.
+    ol_update_kwargs={'constraint_type': 'l2'},
+    reset_threshold=1e10, #just turn this off by default,
+    rand_scaling_type='uniform',
+    do_logging=True):
+    '''
+    arguments:
+        params:  model parameters pytree
+        lr: "learning rate" (actually a constraint on the update norm)
+        rng: jax rng (you should already have split the rng before providing it here)
+        weight_decay: weight decay (still not sure the right way to apply this, so it may or may not be a great idea).
+        
+        ol_init: initialization function for online learner
+        ol_args: arguments  to provide to online learner
+        ol_kwargs: kwarguments for online learning
+        ol_reset_fn: reset function (recommend that this be not used by setting 'reset_threshold' really large later. It is a bit experimental.
+        ol_update_kwargs: extra kwargs for ol_momentum_update. Probably should not override the do_decrease_guard=False default (it is also experimental)
+            but constraint_type could be either 'l2' or 'infinity' to indicate whether the "lr" represents a per-coordinate or global constraint.
+        reset_threshold: make this large.
+        rand_scaling_type: could be 'uniform', 'exponential' or 'none'.
+        do_logging: whether to output logs.
+
+
+    returns:
+        state: optimizer state pytree.
+        update_fn: a function that performs the updates. It is nearly the same as optax optimizer:
+            update_fn(grad, state, params) will return
+            updates, next_state, log_dict
+            and updates can be applied with optax.apply_updates.
+            log_dict is a dictionary of logging info. 
+    '''
+
+
+    ol_momentum_state, update_fn = OL_momentum_init(
+        params,
+        ol_init,
+        ol_args,
+        ol_kwargs,
+        ol_update_fn,
+        ol_reset_fn,
+        ol_reset_kwargs,
+        ol_update_kwargs,
+        weight_decay,
+        reset_threshold,
+        rand_scaling_type
+    )
+
+    state = {
+        'rng': rng,
+        'lr': lr,
+        'ol_momentum_state': ol_momentum_state
+    }
+
+
+    def get_updates(grad, state, params, do_logging=do_logging):
+
+        # we just lie about the loss. The optimizer never looks at it anyway.
+        loss_and_grad_fn = lambda x: ({'loss': 0.0}, grad)
+
+        # lie about the constants in the model state also:
+        model_state = {
+            'params': params,
+            'constants': jnp.zeros(1),
+        }
+
+        model_and_example_state = {
+            'model_state': model_state
+        }
+
+
+        rng = state['rng']
+        scale = state['lr']
+        ol_momentum_state = state['ol_momentum_state']
+
+
+        
+
+        rng_next, value, grad, model_state_next, opt_state_next, log_dict = update_fn(
+            loss_and_grad_fn,
+            rng,
+            model_and_example_state,
+            ol_momentum_state,
+            scale,
+            do_logging=do_logging
+        )
+
+        state_next = {
+            'rng': rng_next,
+            'lr': scale,
+            'ol_momentum_state': opt_state_next,
+        }
+
+        params_next = model_state_next['params']
+
+        updates  = tree_map(
+            lambda a, b: a - b,
+            params_next,
+            params
+        )
+
+        return updates, state_next, log_dict
+
+    return state, get_updates
 
