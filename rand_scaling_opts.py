@@ -1668,6 +1668,9 @@ def random_scale_update(rng, state, grad, updates):
 #    ol_update_kwargs={'constraint_type': 'l2'} # best to leave all other arguments as default probably. These are the only ones I'd recommend trying to change.
 #    )
 #
+#   the 'constraint_type' argument influences how the "lr" parameter is interpreted:
+#   if it is 'l2', then the "lr" is a bound on the l2 norm of the update. If it is 'infinity', then "lr" is a bound on the infinity norm of the update.
+#
 #
 # in training loop:
 # grads = grad_fn(params, minibatch)  # should have same pytree shape  as params argument above.
