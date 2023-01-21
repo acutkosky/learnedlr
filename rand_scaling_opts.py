@@ -1198,6 +1198,8 @@ def OL_momentum_update(rand_scaling_type,
     constraint_type: string describing how we enforce the constraints specified by "scale" argument (basically,
         the learning rate). If 'infinity', then we project updates into an L_infinity ball (i.e. clip the 
         coordinates to [-scale, scale]). If 'l2', then we project into an l2 ball.
+        if 'per_layer_l2', then we project each *layer* (i.e. leaf of the JAX pytree of updates) into an
+        L2 ball.
 
         if constraint_type == 'adaptive', then we use L2 constraints, but the use of scaling is different.
         In this mode, we set the constraint to be: (scaling + max(total_reward, 0))/( (1e-8 + grad_norm) * sqrt(iteration_count))
@@ -1292,6 +1294,31 @@ def OL_momentum_update(rand_scaling_type,
             ol_prediction,
             grad
         )
+    elif constraint_type == 'per_layer_l2':
+        prev_prediction_layer_norms = tree_map(
+            lambda x: 1e-8 + jnp.linalg.norm(x),
+            ol_prediction
+        )
+
+        # compute gradient projection along prediction direction for each layer. We only need this if it is negative, and the prediction norm
+        # is bigger than the constraint. That is, we only want to correct the gradient if the gradient is
+        # pushing us further outside the constraint.
+        prediction_grad_projection = tree_map(
+            lambda olp, g, norm: jnp.minimum(
+                jnp.sum( olp * g )/norm**2, 0
+            ) * (norm > last_constraint),
+            ol_prediction,
+            grad,
+            prev_prediction_layer_norms
+        )
+
+        constrained_grad = tree_map(
+            lambda p, g, pgp: g - pgp * p,
+            ol_prediction,
+            grad,
+            prediction_grad_projection,
+        )
+
 
 
     ol_state_next, ol_logs = ol_update(constrained_grad, ol_state, do_logging)
@@ -1310,7 +1337,7 @@ def OL_momentum_update(rand_scaling_type,
             ol_state_next['prediction'],
             true_params,
         )
-        last_constraint_update = scale
+        # last_constraint_update = scale
     elif constraint_type == 'l2' or constraint_type == 'adaptive':
 
         if constraint_type == 'adaptive':
@@ -1324,7 +1351,20 @@ def OL_momentum_update(rand_scaling_type,
             ol_state_next['prediction'],
             true_params,
         )
-        last_constraint_update = scale
+        # last_constraint_update = scale
+    elif constraint_type == 'per_layer_l2':
+        truncated_scale = tree_map(
+            lambda ol_p: jnp.minimum(1.0, scale/(1e-8 + jnp.linalg.norm(ol_p))),
+            ol_state_next['prediction']
+        )
+        offset = tree_map(
+            lambda ol_p, p, trunc: ol_p * trunc - scale * weight_decay * p,
+            ol_state_next['prediction'],
+            true_params,
+            truncated_scale,
+        )
+
+    last_constraint_update = scale
 
     params_next = tree_map(lambda p, o: p+ rand_scaling * o, true_params, offset)
 
@@ -1403,6 +1443,11 @@ def OL_momentum_update(rand_scaling_type,
             'param_norm': tree_norm(params),
             'const_grad_pred_prod': tree_dot(constrained_grad, ol_prediction),
         }
+        if constraint_type == 'per_layer_l2':
+            log_dict['max_per_layer_update_norms'] = tree_map(
+                lambda x: jnp.linalg.norm(x),
+                offset
+            )
         log_dict.update(ol_logs)
         # for key, value in ol_logs.items():
         #     log_dict['ol_'+key] = value
@@ -1670,6 +1715,7 @@ def random_scale_update(rng, state, grad, updates):
 #
 #   the 'constraint_type' argument influences how the "lr" parameter is interpreted:
 #   if it is 'l2', then the "lr" is a bound on the l2 norm of the update. If it is 'infinity', then "lr" is a bound on the infinity norm of the update.
+#   if it is 'per_layer_l2' then "lr" is a bound on the norm of each layer's update.
 #
 #
 # in training loop:
@@ -1680,6 +1726,8 @@ def random_scale_update(rng, state, grad, updates):
 #
 #
 # if you want to adjust the learning rate on-the-fly, it is accesible in opt_state['lr']
+# you can also now provide a fourth "lr_override" argument to update_fn, which will multiply the opt_state['lr'] by the
+# provided argument during that step.
 #
 #####
     
@@ -1717,6 +1765,7 @@ def wrap_ol_momentum_like_optax(
         ol_reset_fn: reset function (recommend that this be not used by setting 'reset_threshold' really large later. It is a bit experimental.
         ol_update_kwargs: extra kwargs for ol_momentum_update. Probably should not override the do_decrease_guard=False default (it is also experimental)
             but constraint_type could be either 'l2' or 'infinity' to indicate whether the "lr" represents a per-coordinate or global constraint.
+            Can also set constraint_type to 'per_layer_lr' to do l2 constraint layerwise (sort of a lamb-like mix of l2/infinity)
         reset_threshold: make this large.
         rand_scaling_type: could be 'uniform', 'exponential' or 'none'.
         do_logging: whether to output logs.
@@ -1752,8 +1801,7 @@ def wrap_ol_momentum_like_optax(
         'ol_momentum_state': ol_momentum_state
     }
 
-
-    def get_updates(grad, state, params, do_logging=do_logging):
+    def get_updates(grad, state, params, lr_rescale=1.0, do_logging=do_logging):
 
         # we just lie about the loss. The optimizer never looks at it anyway.
         loss_and_grad_fn = lambda x: ({'loss': 0.0}, grad)
@@ -1781,7 +1829,7 @@ def wrap_ol_momentum_like_optax(
             rng,
             model_and_example_state,
             ol_momentum_state,
-            scale,
+            scale * lr_rescale,
             do_logging=do_logging
         )
 
