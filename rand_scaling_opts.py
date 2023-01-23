@@ -1812,9 +1812,9 @@ def random_scale_update(rand_scaling_type, rng, state, grad, updates):
 #  usage:
 #
 # opt_state, update_fn = wrap_ol_momentum_like_optax(params, lr, rng, weight_decay,
-#    ol_init=simple_fr_noconst_init, (could also true simple_fr_init, or simple_pistol_sq_init with corresponding changes to next arguments)
-#    ol_update_fn=simple_fr_noconst_update,
-#    ol_reset_fn=simple_fr_noconst_reset,
+#    ol_init=simple_fr_init, (could also true simple_fr_noconst_init, or simple_pistol_sq_init with corresponding changes to next arguments)
+#    ol_update_fn=simple_fr_update,
+#    ol_reset_fn=simple_fr_reset,
 #    ol_kwargs={
 #        'base-lr':  1e-4,
 #        'eta': 0.5,
@@ -1849,15 +1849,15 @@ def wrap_ol_momentum_like_optax(
     lr,
     rng,
     weight_decay=0.0,
-    ol_init=simple_fr_noconst_init,
+    ol_init=simple_fr_init,
     ol_args=[],
     ol_kwargs={
         'base-lr':  1e-4,
         'eta': 1.0,
         'decay': 0.99
     },
-    ol_update_fn=simple_fr_noconst_update,
-    ol_reset_fn=simple_fr_noconst_reset,
+    ol_update_fn=simple_fr_update,
+    ol_reset_fn=simple_fr_reset,
     ol_reset_kwargs={'do_decrease': False}, # this will never be called anyway by default unless 'reset_threshold' is set to a non-huge value.
     ol_update_kwargs={'constraint_type': 'l2'},
     reset_threshold=1e10, #just turn this off by default,
