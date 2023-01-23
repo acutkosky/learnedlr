@@ -236,6 +236,84 @@ def simple_fr_update(grad, opt_state, do_logging=False):
 
 
 
+def simple_pistol_sq_init(params, base_lr=1.0, eta=1e-6, decay=1.0):
+    state = {
+        'grad_squared_sum': zeros_like(params),
+        'prediction': zeros_like(params),
+        'decay': decay,
+        'eta': eta,
+        'base_lr': base_lr,
+        'grad_sum': zeros_like(params),
+        'max_grad': zeros_like(params),
+    }
+
+    return state
+
+def simple_pistol_sq_reset(old_state, epoch_count, do_decrease=True, reset_scaling=1.0):
+    state = {
+        'grad_squared_sum': zeros_like(old_state['grad_squared_sum']),
+        'prediction': zeros_like(old_state['prediction']),
+        'decay': old_state['decay'],
+        'eta': old_state['eta'],
+        'base_lr':  reset_scaling * old_state['base_lr']*(epoch_count + 1)/(epoch_count + 2) if do_decrease else reset_scaling * old_state['base_lr'],
+        'grad_sum': zeros_like(old_state['grad_sum']),
+        'max_grad': zeros_like(old_state['max_grad'])
+    }
+
+    return state   
+
+def simple_pistol_sq_update(grad, opt_state, do_logging=False):
+
+    grad_squared_sum = opt_state['grad_squared_sum']
+    prediction = opt_state['prediction']
+    decay = opt_state['decay']
+    eta = opt_state['eta']
+    base_lr = opt_state['base_lr']
+    grad_sum = opt_state['grad_sum']
+    max_grad = opt_state['max_grad']
+
+    grad_sum_next = tree_map(
+        lambda s, g: s * decay + g,
+        grad_sum,
+        grad
+    )
+
+    grad_squared_sum_next = tree_map(
+        lambda s, g: s * decay**2 + g**2,
+        grad_squared_sum,
+        grad
+    )
+
+    max_grad_next = tree_map(
+        lambda s, g: jnp.maximum(s * decay, jnp.abs(g)),
+        max_grad,
+        grad
+    )
+
+    prediction_next = tree_map(
+        lambda g, m, s: -base_lr * g / (1e-8 + s)  * (jnp.exp(eta * (g**2) / (1e-8 + s)) - 1.0),
+        grad_sum_next,
+        max_grad_next,
+        grad_squared_sum_next,
+    )
+
+    opt_state_next = {
+        'grad_squared_sum': grad_squared_sum_next,
+        'prediction': prediction_next,
+        'decay': decay,
+        'eta': eta,
+        'base_lr': base_lr,
+        'grad_sum': grad_sum_next,
+        'max_grad': max_grad_next
+    }
+
+    return opt_state_next, {
+        'base_lr': base_lr,
+    }
+
+
+
+
 
 
 def simple_fr_noconst_init(params, base_lr=1.0, eta=1e-6, decay=1.0):
@@ -1734,6 +1812,9 @@ def random_scale_update(rand_scaling_type, rng, state, grad, updates):
 #  usage:
 #
 # opt_state, update_fn = wrap_ol_momentum_like_optax(params, lr, rng, weight_decay,
+#    ol_init=simple_fr_noconst_init,
+#    ol_update_fn=simple_fr_noconst_update,
+#    ol_reset_fn=simple_fr_noconst_reset,
 #    ol_kwargs={
 #        'base-lr':  1e-4,
 #        'eta': 0.5,
