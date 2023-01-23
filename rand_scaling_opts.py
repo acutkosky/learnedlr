@@ -1812,7 +1812,7 @@ def random_scale_update(rand_scaling_type, rng, state, grad, updates):
 #  usage:
 #
 # opt_state, update_fn = wrap_ol_momentum_like_optax(params, lr, rng, weight_decay,
-#    ol_init=simple_fr_noconst_init,
+#    ol_init=simple_fr_noconst_init, (could also true simple_fr_init, or simple_pistol_sq_init with corresponding changes to next arguments)
 #    ol_update_fn=simple_fr_noconst_update,
 #    ol_reset_fn=simple_fr_noconst_reset,
 #    ol_kwargs={
