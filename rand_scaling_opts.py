@@ -1473,7 +1473,7 @@ def OL_momentum_update(rand_scaling_type,
 #
 # params = model_state['params'] # or however the params are stored.
 # rescaling_state = init_learned_scale(params, simple_fr_init, base_lr=1e0, eta=1.0, decay=0.999, min_bound=1e-6, max_bound=1e1)
-# rescaling_fn = functools.partial(learned_scale_update, simple_fr_update)
+# rescaling_fn = functools.partial(learned_scale_update, simple_fr_update, rand_scale_type='uniform', residual=True)
 #
 # (probably initialize your optax uptimizer with whatever standard learning rate schedule or similar).
 # (alternatively, you could initialize the optax optimizer with a larger constant learning rate, but
@@ -1510,7 +1510,7 @@ def init_learned_scale(params, ol_init=simple_fr_init, min_scale=1e-6, max_scale
 
     return update_state
 
-def learned_scale_update(ol_update, rand_scale_type, rng, state, grad, updates):
+def learned_scale_update(ol_update, rng, state, grad, updates, rand_scale_type, residual,):
     '''
     rescales an update with an online learner.
     
@@ -1518,8 +1518,6 @@ def learned_scale_update(ol_update, rand_scale_type, rng, state, grad, updates):
         ol_update: function that updates an online learner.
             Takes as input an online learner state and a (meta)-gradient.
             Returns a new online learner state and some logs dict (which we ignore).
-        rand_scale_type: 'uniform', 'exponential', or 'none'
-
             *** this argument is not a jax type, so it should be removed with a partial
                 or set as a static argument in order to compile ***
 
@@ -1528,7 +1526,11 @@ def learned_scale_update(ol_update, rand_scale_type, rng, state, grad, updates):
         grad: gradient of loss.
         update: update from base algorithm to rescale. Should be same
             pytree shape as grad.
-    
+
+        rand_scale_type: 'uniform', 'exponential', or 'none'
+        residual: boolean flag indicating whether to learn a residual or not.
+        *** these arguments are also not JAX types...***
+
     returns:
         state_next: next value for the state.
         rng: next value for the rng.
@@ -1563,7 +1565,14 @@ def learned_scale_update(ol_update, rand_scale_type, rng, state, grad, updates):
     elif rand_scale_type == 'none':
         rand = 1.0
         missing_rand = 0.0
+    elif rand_scale_type == 'debug_rand':
+        rand = jax.random.uniform(cur_rng)
+        missing_rand = 0.0
 
+    if residual:
+        base_scale_value = 1.0
+    else:
+        base_scale_value = 0.0
     
 
     ol_grad = tree_dot(prev_updates, grad)
@@ -1579,7 +1588,7 @@ def learned_scale_update(ol_update, rand_scale_type, rng, state, grad, updates):
     ol_state_next, ol_logs = ol_update(ol_grad, ol_state)
     del ol_logs
 
-    unclipped_nonrand_scale = ol_state_next['prediction']
+    unclipped_nonrand_scale = base_scale_value + ol_state_next['prediction']
 
     clipped_nonrand_scale = jnp.clip(unclipped_nonrand_scale, a_min=min_scale, a_max=max_scale)
 
@@ -1616,7 +1625,10 @@ def learned_scale_update(ol_update, rand_scale_type, rng, state, grad, updates):
         'estimated_loss_gap': estimated_loss_gap_next,
         'random_learned_scaling': scaling,
         'nonrandom_learned_scaling': clipped_nonrand_scale,
-        'grad_norm': tree_norm(grad)
+        'ol_prediction': ol_state_next['prediction'],
+        'grad_norm': tree_norm(grad),
+        'update_norm': tree_norm(updates),
+        'rand_value': rand,
     }
 
     return state_next, rng, rescaled_update, log_data
@@ -1643,16 +1655,21 @@ def init_random_scale(params):
 
     return update_state
 
-def random_scale_update(rng, state, grad, updates):
+
+def random_scale_update(rand_scaling_type, rng, state, grad, updates):
     '''
     rescales an update with a random number.
     
     args:
+        rand_scaling_type: can be 'uniform', 'exponential', or 'none'
+        *** CAUTION: FIRST ARGUMENT IS NOT A JAX TYPE AND SO CANNOT BE JITTED ***
+
         rng: jax rng.
         state: state for this scaling learner.
         grad: (unused, only here so that it has the same signature as learned_scale_update).
         updates: updates from base algorithm to rescale. Should be same
             pytree shape as the "params" argument provided to "init_random_scale".
+
     
     returns:
         state_next: next value for the state.
@@ -1673,8 +1690,20 @@ def random_scale_update(rng, state, grad, updates):
 
     rng, cur_rng = jax.random.split(rng)
 
-    rand = jax.random.uniform(cur_rng)
-    missing_scaling_next = (1.0 - rand)
+    if rand_scaling_type == 'uniform':
+        rand = jax.random.uniform(cur_rng)
+        missing_scaling_next = (1.0 - rand)
+    elif rand_scaling_type == 'exponential':
+        rand = jax.random.exponential(cur_rng)
+        missing_scaling_next = 0.0
+    elif rand_scaling_type == 'none':
+        rand = 1.0
+        missing_scaling_next = 0.0
+    elif rand_scaling_type == 'half':
+        rand = 0.5
+        missing_scaling_next = 0.5
+    else:
+        raise ValueError(f'unknown rand_scaling_type: {rand_scaling_type}')
 
 
     #
@@ -1707,10 +1736,11 @@ def random_scale_update(rng, state, grad, updates):
 # opt_state, update_fn = wrap_ol_momentum_like_optax(params, lr, rng, weight_decay,
 #    ol_kwargs={
 #        'base-lr':  1e-4,
-#        'eta': 1.0,
-#        'decay': 0.99
+#        'eta': 0.5,
+#        'decay': 0.999
 #    },
-#    ol_update_kwargs={'constraint_type': 'l2'} # best to leave all other arguments as default probably. These are the only ones I'd recommend trying to change.
+#    ol_update_kwargs={'constraint_type': 'l2'}, # best to leave all other arguments as default probably. These are the only ones I'd recommend trying to change.
+#    rand_scaling_type='none', # this one controls whether randomization is used and if so what type. Set to 'uniform' for uniform in [0,1]. set to 'none' to turn off randomization.
 #    )
 #
 #   the 'constraint_type' argument influences how the "lr" parameter is interpreted:

@@ -51,7 +51,7 @@ def wrap_new_ol_opt_step(update_fn):
         model_state = model_and_example_state['model_state']
         constants = model_state['constants']
         params = model_state['params']
-        updates, opt_state, logs = update_fn(grad,  opt_state, model_state['params'], do_logging)
+        updates, opt_state, logs = update_fn(grad,  opt_state, model_state['params'], scale, do_logging)
 
 
 
@@ -92,7 +92,7 @@ def wrap_opt_step(base_step, base_state, optax_opt_fn, model_state, clip, *args,
 
         updates = jax.tree_util.tree_map(lambda p: scale * p, updates)
 
-        base_state, rng, rescaled_updates, logs = base_step(rng, base_state, grad, updates, model_state['params'])
+        base_state, rng, rescaled_updates, logs = base_step(rng, base_state, grad, updates)
 
         opt_state = {
             'optax_state': optax_opt_state,
@@ -289,7 +289,7 @@ class Trainer:
                 self.optimizer_state, update_fn = rand_scaling_opts.wrap_ol_momentum_like_optax(
                     model_state['params'],
                     rng=new_rng,
-                    lr=config.lr,
+                    lr=1.0,
                     weight_decay=config.wd,
                     ol_init=getattr(rand_scaling_opts, opt_conf.ol_init),
                     ol_args=to_container(opt_conf.ol_args),
@@ -323,21 +323,27 @@ class Trainer:
                     rand_scaling_type=opt_conf.rand_scaling_type,
                     use_loss_diff=opt_conf.use_loss_diff
                 )
-        if self.config.optimizer == 'test_optax_scale':
+        if self.config.optimizer == 'test_optax_learned_scale':
+            opt_conf = config.custom_opt.test_optax_learned_scale
             base_state = rand_scaling_opts.init_learned_scale(
                 model_state['params'],
-                rand_scaling_opts.simple_fr_init,
-                base_lr=1.0,
-                eta=0.7,
-                decay=0.999,
-                max_scale=1e1)
+                ol_init=getattr(rand_scaling_opts, opt_conf.ol_init),
+                max_scale=opt_conf.max_scale,
+                min_scale=opt_conf.min_scale,
+                **to_container(opt_conf.ol_kwargs))
             base_step = functools.partial(
                 rand_scaling_opts.learned_scale_update,
-                rand_scaling_opts.simple_fr_update,
-                'uniform',
+                getattr(rand_scaling_opts, opt_conf.ol_update_fn),
+                **to_container(opt_conf.scale_update_kwargs)
             )
 
-            self.optimizer_state, self.optimizer_step = wrap_opt_step(base_step, base_state, optax.adamw, model_state, config.clip, learning_rate=1.0, b1=config.beta1, b2=config.beta2, weight_decay=config.wd)#, *args, **kwargs)
+            optax_optimizer=getattr(optax, opt_conf.optax_optimizer)
+            optax_args=to_container(opt_conf.optax_args)
+            optax_kwargs=to_container(opt_conf.optax_kwargs)
+            clip=opt_conf.clip
+
+
+            self.optimizer_state, self.optimizer_step = wrap_opt_step(base_step, base_state, optax_optimizer, model_state, clip, *optax_args, **optax_kwargs)#, *args, **kwargs)
 
         if self.config.optimizer == 'test_optax_random_scale':
             base_state = rand_scaling_opts.init_random_scale(
@@ -345,7 +351,13 @@ class Trainer:
             )
             base_step = rand_scaling_opts.random_scale_update
 
-            self.optimizer_state, self.optimizer_step = wrap_opt_step(base_step, base_state, optax.adamw, model_state, config.clip, learning_rate=1.0, b1=config.beta1, b2=config.beta2, weight_decay=config.wd)
+            optax_optimizer=getattr(optax, opt_conf.optax_optimizer),
+            optax_args=to_container(opt_conf.optax_args),
+            optax_kwargs=to_container(opt_conf.optax_kwargs),
+            clip=opt_conf.clip,
+            
+
+            self.optimizer_state, self.optimizer_step = wrap_opt_step(base_step, base_state, optax_optimizer, model_state, clip, *optax_args, **optax_kwargs) #$optax.adamw, model_state, config.clip, learning_rate=1.0, b1=config.beta1, b2=config.beta2, weight_decay=config.wd)
 
 
         # self.losses = []
